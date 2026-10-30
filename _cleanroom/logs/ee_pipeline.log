@@ -1,0 +1,86 @@
+==============================================================================
+8-D EE action layer acceptance test (numpy + mujoco only)
+src: /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/src/ee_retarget
+==============================================================================
+
+[1] analytic synthetic hand (truth by construction)
+  [PASS] anchor closed (d_min)   err=0.000e+00
+  [PASS] pos3 closed (d_min)   err=0.000e+00
+  [PASS] R three axes closed (d_min)   err=2.220e-16
+  [PASS] d_t closed (d_min)   d_t=0.020000000000000 expected=0.020000000000000
+  [PASS] g closed (d_min) == 0.0   g=0.000000000000000
+  [PASS] rotvec round-trip closed (d_min)   err=2.220e-16
+  [PASS] reserved slot closed (d_min)
+  [PASS] anchor mid (d_mean)   err=0.000e+00
+  [PASS] pos3 mid (d_mean)   err=0.000e+00
+  [PASS] R three axes mid (d_mean)   err=2.220e-16
+  [PASS] d_t mid (d_mean)   d_t=0.060000000000000 expected=0.060000000000000
+  [PASS] g mid (d_mean) == 0.5   g=0.500000000000000
+  [PASS] rotvec round-trip mid (d_mean)   err=2.220e-16
+  [PASS] reserved slot mid (d_mean)
+  [PASS] anchor open (d_max)   err=0.000e+00
+  [PASS] pos3 open (d_max)   err=0.000e+00
+  [PASS] R three axes open (d_max)   err=2.220e-16
+  [PASS] d_t open (d_max)   d_t=0.100000000000000 expected=0.100000000000000
+  [PASS] g open (d_max) == 1.0   g=1.000000000000000
+  [PASS] rotvec round-trip open (d_max)   err=2.220e-16
+  [PASS] reserved slot open (d_max)
+  [PASS] g clipped below d_min
+  [PASS] g clipped above d_max
+  [PASS] T_base_cam position   err=0.000e+00
+  [PASS] T_base_cam rotation   err=2.220e-16
+  [PASS] palm-normal sign rule   err=2.220e-16  Z.ref=1.000000  z_flipped=False
+
+[2] orthonormality / chirality
+  [PASS] 50 random hand frames: |R^T R - I|, |det R - 1|, |X.Z| all < 1e-09   max |R^T R-I|=6.66e-16, max |det-1|=4.44e-16, max |X.Z|=9.63e-17
+
+[3] NaN propagation (no silent zero-fill)
+  [PASS] each of the 21 keypoints NaN -> all 8 outputs NaN
+  [PASS] NaN R_wrist -> all-NaN output
+  [PASS] NaN T_base_cam -> all-NaN output
+  [PASS] finite input -> finite output
+
+  model: /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/jaka_zu3_mujoco.xml
+  site 'tool0' at qpos0 = [0.47400, 0.04350, 0.83305]
+  arm DoF columns [12, 13, 14, 15, 16, 17] (nq=20, nv=18; props have free joints, hence by name)
+
+[4] IK convergence on 100 FK-sampled reachable targets
+  warm start only (home seed, single DLS attempt): 65/100 converged
+  position error  [m]    p50=5.733e-04  p95=9.648e-04  max=9.922e-04
+  orientation err [deg]  p50=0.0828  p95=0.4374  max=0.4977
+  success rate           100/100 = 100.0%
+  mean DLS iterations    45.2  (mean extra restarts 1.34, max 16)
+  [PASS] success rate >= 95%   measured 100.0%
+  [PASS] converged solutions respect the tolerances
+
+[5] joint limits respected
+  [PASS] all 100 solutions inside the model joint limits   smallest distance to a limit = 0.000e+00 rad
+  [PASS] within_limits() rejects an out-of-range vector
+  joint limits  [rad]    [-6.28, 6.28], [-1.48, 4.62], [-3.05, 3.05], [-1.48, 4.62], [-6.28, 6.28], [-6.28, 6.28]
+
+[5b] configurable TCP offset + analytic Jacobian vs finite differences
+  [PASS] TCP offset composition   |dp|=0.000e+00
+  [PASS] default solver is offset-free
+  [PASS] Jacobian rows vs central differences   max |dJp|=9.00e-11  max |dJr|=2.78e-10
+  [PASS] IK converges on a TCP-offset target   pos_err=3.303e-04 m ang_err=0.0350 deg iters=106
+
+[6] end-to-end: synthetic hand -> EE(8) -> IK -> qpos -> FK
+  trial 0: hand->EE residual 0.00e+00 m / 2.41e-06 deg | IK residual 9.266e-04 m / 0.0795 deg | converged=True iters=121 | g=0.500
+  [PASS] trial 0 EE residual < 1e-3 m / 0.5 deg
+  [PASS] trial 0 IK residual < 1e-3 m / 0.5 deg
+  trial 1: hand->EE residual 0.00e+00 m / 0.00e+00 deg | IK residual 7.100e-04 m / 0.0764 deg | converged=True iters=12 | g=0.500
+  [PASS] trial 1 EE residual < 1e-3 m / 0.5 deg
+  [PASS] trial 1 IK residual < 1e-3 m / 0.5 deg
+  trial 2: hand->EE residual 0.00e+00 m / 0.00e+00 deg | IK residual 1.747e-04 m / 0.0382 deg | converged=True iters=12 | g=0.500
+  [PASS] trial 2 EE residual < 1e-3 m / 0.5 deg
+  [PASS] trial 2 IK residual < 1e-3 m / 0.5 deg
+  trial 3: hand->EE residual 0.00e+00 m / 1.21e-06 deg | IK residual 9.940e-05 m / 0.0425 deg | converged=True iters=13 | g=0.500
+  [PASS] trial 3 EE residual < 1e-3 m / 0.5 deg
+  [PASS] trial 3 IK residual < 1e-3 m / 0.5 deg
+  trial 4: hand->EE residual 0.00e+00 m / 3.19e-06 deg | IK residual 9.328e-04 m / 0.0863 deg | converged=True iters=184 | g=0.500
+  [PASS] trial 4 EE residual < 1e-3 m / 0.5 deg
+  [PASS] trial 4 IK residual < 1e-3 m / 0.5 deg
+  worst residual         9.328e-04 m / 0.0863 deg
+
+==============================================================================
+ALL CHECKS PASSED

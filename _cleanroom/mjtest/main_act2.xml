@@ -1,0 +1,7 @@
+<mujoco model="t3">
+  <worldbody>
+    <body name="arm"><geom type="capsule" size="0.02 0.1"/><joint name="j1" type="hinge" axis="0 0 1"/>
+      <include file="inc_act2.xml"/>
+    </body>
+  </worldbody>
+</mujoco>

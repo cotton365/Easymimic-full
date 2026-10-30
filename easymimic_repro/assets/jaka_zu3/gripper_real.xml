@@ -1,0 +1,84 @@
+<!-- Real two-finger gripper (装配体2.STL export), included INSIDE Link_6 of robot.xml.
+
+     Source: third_party/jaka-zu3-mujoco @ c592951, assets/gripper/*.stl (already in metres,
+     no <mesh scale>/<mesh euler>). MJCF's <include> splices the CHILDREN of this file's root
+     element (a single-<body> root is silently dropped), hence the <gripper_real_fragment>
+     wrapper. <asset> and <actuator> are root-only, so the four meshes and the joint_7
+     actuator are declared in robot.xml.
+
+     MOUNT (measured on the mesh, not copied from upstream):
+       Link_6.STL spans local z [-0.03050, 0.00000].  The z = 0 end carries a planar
+       +z-facing flange disc (0.001967 m^2 over 537 triangles; 7367 vertices sit in the
+       last 1.53 mm) and the z = -0.03050 end a smooth -z annulus (0.003625 m^2) that
+       abuts Link_5.STL exactly in the assembled pose (both meshes meet at world
+       y = 0.0390 with qpos = 0).  The exposed tool face is therefore Link_6 local z = 0
+       and the gripper grows along +z.  gripper_base is mounted at pos 0 0 0 with NO
+       rotation: the housing's own z = 0 face IS the flange face.
+       (The placeholder gripper_pg2.xml sat at z = -0.035, i.e. 3.5 cm inside Link_5's
+       volume - the placeholder pointed the wrong way, the upstream mount is correct.
+       Mounting this 0.135 m assembly at z = -0.035 would drive ~0.10 m of housing
+       straight through the wrist.)
+
+     KINEMATICS: joint_7 is a hinge about -y through (-0.0000184, 0.025, 0.0549234).
+     Measured on the fin faces: q = 0 leaves a 2.4 mm fin-to-fin gap (closed), q = 0.9
+     swings the moving fin 46 mm towards -x (open), i.e. ctrl_7 = g * 0.9 with
+     g = 1 == open, matching the 8-dim action definition.  The pads below reproduce the
+     same direction: their closed gap is 0.0022 m and it widens as q grows.
+
+     COLLISION: the assembly is 343666 triangles in 27 parts; a convex hull of the fixed
+     part would be a solid 60 x 60 x 135 mm block that swallows the jaw.  Collision is two
+     hand-built boxes at the finger tips instead (group 3, contype/conaffinity 1, condim 4),
+     and every mesh geom is contype = conaffinity = 0, the repo convention that visual
+     meshes never collide.
+
+     PAD PROXIES: the real fins are tilted (fixed fin normal ~(-0.947, 0, 0.32), moving fin
+     grip edge ~(0.911, 0, -0.415) tilted 24 deg).  Both boxes extrude along Link_6 z so the
+     squeeze axis stays horizontal, which is what a top grasp on a table needs.
+     The MOVING box carries quat "0.99363 0 +0.11278 0" = R_y(+0.226), which cancels joint_7's
+     swing (measured: the pad's inner normal in the gripper_base frame is
+     (cos q, 0, +sin q), i.e. R_y(-q)) at the nominal 20 mm grip stroke, so that at
+     q7 = 0.226 rad its inner face is exactly parallel to the fixed pad's face
+     (measured after the fix: dot = 1.000000, wedge 0.00 deg).  Without it
+     the tilted plate acts as a wedge: measured with the axis-aligned box, the moving pad's
+     inner normal was (0.979, 0, -0.202) at the pinch, i.e. 11.7 deg downwards, and a 20 mm
+     8 g cube crept 7.6 mm further out of the fingers per 45 mm of lift (cube centre in the
+     tool frame: +0.0107 -> +0.0183) and was ejected at 50 mm.  Heights are 16 mm, i.e. 4 mm
+     shorter than the 20 mm cube, so the pad bottom clears the table top by 2 mm when the
+     cube is grasped at its centre. -->
+<gripper_real_fragment>
+
+  <body name="gripper_base" pos="0 0 0">
+
+    <!-- upstream inertial block (jaka_zu3_mujoco.xml:87); total 0.45 kg fixed + 0.08 kg jaw -->
+    <inertial pos="0.01 0 0.022" mass="0.45" diaginertia="0.00055 0.00075 0.00070"/>
+
+    <geom name="gripper_housing" class="gr_visual" type="mesh" mesh="gripper_fixed_housing_mesh"
+          rgba="0.86 0.45 0.08 1"/>
+    <geom name="gripper_hardware_a" class="gr_visual" type="mesh" mesh="gripper_fixed_hardware_a_mesh"
+          rgba="0.24 0.44 0.70 1"/>
+    <geom name="gripper_hardware_b" class="gr_visual" type="mesh" mesh="gripper_fixed_hardware_b_mesh"
+          rgba="0.24 0.44 0.70 1"/>
+
+    <!-- fixed jaw: box proxy for the fixed fin.  x in [0.0272, 0.0305] = the fin's own
+         x extent, so the inner (gripping) face sits on the real fin face at x = 0.0272. -->
+    <geom name="gripper_pad_fixed" class="gr_pad" type="box" size="0.00165 0.0125 0.008"
+          pos="0.02885 -0.0035 0.127"/>
+
+    <body name="gripper_moving_jaw" pos="-0.0000184 0.025 0.0549234">
+      <joint name="joint_7" type="hinge" axis="0 -1 0" range="0 0.9" limited="true"
+             damping="0.25" armature="0.0002"/>
+      <inertial pos="0.034 0 0.027" mass="0.08" diaginertia="0.00004 0.00008 0.00006"/>
+      <geom name="gripper_jaw_visual" class="gr_visual" type="mesh" mesh="gripper_moving_mesh"
+            rgba="0.75 0.12 0.58 1"/>
+      <!-- moving jaw: 2.2 mm thick box, inner face x = 0.0250 at q = 0 -> closed pad gap
+           0.0272 - 0.0250 = 0.0022 m.  pos is the mount-frame point (0.02385, -0.0035,
+           0.127) minus the pivot (-0.0000184, 0.025, 0.0549234).  quat = R_y(-0.226),
+           the pre-rotation that makes this face parallel to the fixed pad at the 20 mm
+           grip stroke (see PAD PROXIES in the header for the measurement that forced it). -->
+      <geom name="gripper_pad_moving" class="gr_pad" type="box" size="0.0011 0.0125 0.008"
+            pos="0.0238684 -0.0285 0.0720766" quat="0.99363 0 0.11278 0"/>
+    </body>
+
+  </body>
+
+</gripper_real_fragment>

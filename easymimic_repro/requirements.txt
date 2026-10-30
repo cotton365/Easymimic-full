@@ -1,0 +1,13 @@
+# Verified combination (Python 3.11, Linux x86_64):
+#   python 3.11.17, mujoco 3.16.0, numpy 2.4.6   -> every check re-run green
+#   python 3.11.17, mujoco 3.16.0, numpy 1.26.4  -> every check re-run green too
+#     (1.26.4 is what you end up on after installing mediapipe, which caps numpy at 1.26.x)
+# Nothing else is imported by the verified code paths -- no scipy, no torch,
+# no opencv, no casadi/mink. Keep it that way unless you have a reason.
+#
+# Optional, only for the camera teleop path (README.md section 12):
+#   mediapipe==0.10.21, opencv-python==4.11.0.86
+# Those two are deliberately NOT pinned here: they are imported lazily, and the
+# rest of the repo stays installable without them.
+mujoco==3.16.0
+numpy>=1.26

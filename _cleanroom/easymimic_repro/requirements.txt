@@ -1,0 +1,6 @@
+# Verified combination (Python 3.11, Linux x86_64):
+#   python 3.11.17, mujoco 3.16.0, numpy 2.4.6
+# Nothing else is imported by the verified code paths -- no scipy, no torch,
+# no opencv, no casadi/mink. Keep it that way unless you have a reason.
+mujoco==3.16.0
+numpy==2.4.6

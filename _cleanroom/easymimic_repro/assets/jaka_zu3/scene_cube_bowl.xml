@@ -1,0 +1,65 @@
+<mujoco model="jaka_zu3_scene_cube_bowl">
+  <!-- T1 scene: JAKA Zu3 + placeholder PG2 gripper + self-made table / 2 cm cube / open bowl.
+       Includes robot.xml, which in turn splices gripper_pg2.xml inside Link_6 (the only place
+       MJCF can attach it: there is no attach-to-site, and <actuator> is root-only). -->
+
+  <include file="robot.xml"/>
+
+  <statistic center="0.40 0.00 0.86" extent="1.2"/>
+  <visual>
+    <global offwidth="1280" offheight="960"/>
+    <quality shadowsize="2048"/>
+    <headlight ambient="0.45 0.45 0.45" diffuse="0.55 0.55 0.55" specular="0.1 0.1 0.1"/>
+  </visual>
+
+  <worldbody>
+    <!-- table: 1.20 x 1.00 x 0.04 box, top face exactly at z = 0.80 -->
+    <body name="table">
+      <geom name="table_top" type="box" size="0.60 0.50 0.02" pos="0.35 0.04 0.78"
+            rgba="0.55 0.45 0.34 1" friction="1.0 0.005 0.0001"/>
+    </body>
+
+    <!-- 0.02 m cube, free body, resting on the table -->
+    <body name="cube" pos="0.474 0.0435 0.81">
+      <freejoint name="cube_free"/>
+      <geom name="cube_geom" type="box" size="0.01 0.01 0.01" mass="0.008" condim="4"
+            friction="1.2 0.02 0.002" solref="0.006 1" solimp="0.95 0.99 0.001"
+            rgba="0.85 0.25 0.20 1"/>
+    </body>
+
+    <!-- open bowl: 16 thin wall boxes on a 0.049 m centreline (inner radius 0.045, wall 8 mm,
+         40 mm tall) + a bottom disc. A primitive cylinder cannot be open-mouthed, and a mesh
+         would collide as its convex hull, so the wall is built from segments. -->
+    <body name="bowl" pos="0 0 0">
+      <geom name="bowl_bottom" type="cylinder" size="0.045000 0.001" pos="0.300000 -0.200000 0.801"
+            rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_00" type="box" size="0.004000 0.010234 0.020000" pos="0.349000 -0.200000 0.820000" euler="0 0 0.000000" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_01" type="box" size="0.004000 0.010234 0.020000" pos="0.345270 -0.181249 0.820000" euler="0 0 0.392699" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_02" type="box" size="0.004000 0.010234 0.020000" pos="0.334648 -0.165352 0.820000" euler="0 0 0.785398" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_03" type="box" size="0.004000 0.010234 0.020000" pos="0.318751 -0.154730 0.820000" euler="0 0 1.178097" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_04" type="box" size="0.004000 0.010234 0.020000" pos="0.300000 -0.151000 0.820000" euler="0 0 1.570796" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_05" type="box" size="0.004000 0.010234 0.020000" pos="0.281249 -0.154730 0.820000" euler="0 0 1.963495" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_06" type="box" size="0.004000 0.010234 0.020000" pos="0.265352 -0.165352 0.820000" euler="0 0 2.356194" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_07" type="box" size="0.004000 0.010234 0.020000" pos="0.254730 -0.181249 0.820000" euler="0 0 2.748894" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_08" type="box" size="0.004000 0.010234 0.020000" pos="0.251000 -0.200000 0.820000" euler="0 0 3.141593" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_09" type="box" size="0.004000 0.010234 0.020000" pos="0.254730 -0.218751 0.820000" euler="0 0 3.534292" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_10" type="box" size="0.004000 0.010234 0.020000" pos="0.265352 -0.234648 0.820000" euler="0 0 3.926991" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_11" type="box" size="0.004000 0.010234 0.020000" pos="0.281249 -0.245270 0.820000" euler="0 0 4.319690" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_12" type="box" size="0.004000 0.010234 0.020000" pos="0.300000 -0.249000 0.820000" euler="0 0 4.712389" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_13" type="box" size="0.004000 0.010234 0.020000" pos="0.318751 -0.245270 0.820000" euler="0 0 5.105088" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_14" type="box" size="0.004000 0.010234 0.020000" pos="0.334648 -0.234648 0.820000" euler="0 0 5.497787" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    <geom name="bowl_wall_15" type="box" size="0.004000 0.010234 0.020000" pos="0.345270 -0.218751 0.820000" euler="0 0 5.890486" rgba="0.80 0.72 0.55 1" friction="1.0 0.005 0.0001"/>
+    </body>
+  </worldbody>
+
+  <contact>
+    <!-- the arm base stands on the table top plane (Link_0 bottom 0.79999, table 0.80) -->
+    <exclude body1="Link_0" body2="table"/>
+  </contact>
+
+  <!-- all-zero qpos puts the tool 33 mm above the table, i.e. the wrist flange clips it.
+       "home" raises the arm one shoulder step and opens the gripper. -->
+  <keyframe>
+    <key name="home" qpos="0 0.15 0 0 0 0 0.04" ctrl="0 0.15 0 0 0 0 0.04"/>
+  </keyframe>
+</mujoco>

@@ -1,0 +1,146 @@
+<mujoco model="jaka_zu3">
+  <!-- JAKA Zu3 arm only. Visual meshes are the upstream STL assets
+       (third_party/jaka-zu3-mujoco, git 7c40fec); collision bodies are hand-built
+       capsules/cylinders along each link's principal axis (group 3, contype/conaffinity 1).
+       The 4 upstream <include> files (tabletop + objaverse mug_5/plate_11) are intentionally NOT used. -->
+
+  <!-- meshdir is relative to THIS file, so the model loads from any cwd. -->
+  <compiler angle="radian" autolimits="true" meshdir="../../third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes"/>
+
+  <option timestep="0.002" integrator="implicitfast" gravity="0 0 -9.81"/>
+  <statistic center="0.30 0.05 0.90" extent="1.0"/>
+
+  <visual>
+    <global offwidth="1280" offheight="960"/>
+    <quality shadowsize="2048"/>
+  </visual>
+
+  <default>
+    <joint damping="30" armature="0.05"/>
+    <geom rgba="0.84706 0.84706 0.84706 1"/>
+
+    <default class="collision">
+      <geom group="3" contype="1" conaffinity="1" condim="3" rgba="0.15 0.85 0.35 0.35"/>
+    </default>
+
+    <default class="pg2_frame">
+      <geom group="1" contype="0" conaffinity="0" rgba="0.28 0.30 0.34 1"/>
+    </default>
+
+    <default class="pg2_jaw">
+      <joint damping="2" armature="0.005"/>
+    </default>
+
+    <default class="pg2_pad">
+      <geom group="1" contype="1" conaffinity="1" condim="4"
+            friction="1.5 0.02 0.002" solref="0.006 1" solimp="0.95 0.99 0.001"
+            rgba="0.12 0.32 0.78 1"/>
+    </default>
+  </default>
+
+  <asset>
+    <mesh name="Link_0_mesh" file="Link_0.STL"/>
+    <mesh name="Link_1_mesh" file="Link_1.STL"/>
+    <mesh name="Link_2_mesh" file="Link_2.STL"/>
+    <mesh name="Link_3_mesh" file="Link_3.STL"/>
+    <mesh name="Link_4_mesh" file="Link_4.STL"/>
+    <mesh name="Link_5_mesh" file="Link_5.STL"/>
+    <mesh name="Link_6_mesh" file="Link_6.STL"/>
+  </asset>
+
+  <worldbody>
+    <!-- Link_0 collision: upright cylinder, mesh bbox x/y +-0.0645, z 0..0.086 -->
+    <geom name="Link_0_collision" class="collision" type="cylinder" size="0.056 0.043" pos="0 0 0.043"/>
+
+    <body name="Link_0" pos="-0.002 0 0.79999">
+      <inertial pos="-0.0015666 0.000017294 0.05088" mass="3.6417"
+                fullinertia="0.0050627 0.0051147 0.006537 -0.00000069042 -0.000084162 0.0000029665"/>
+      <geom name="Link_0_visual" type="mesh" mesh="Link_0_mesh" contype="0" conaffinity="0" group="2"/>
+
+      <body name="Link_1" pos="0 0 0.15055">
+        <joint name="joint_1" type="hinge" axis="0 0 1" range="-6.28 6.28"/>
+        <inertial pos="-0.00000038197 0.0039623 -0.0033438" mass="7.0387"
+                  fullinertia="0.012561 0.011919 0.0085506 0.000000081417 -0.000000018051 -0.000087195"/>
+        <geom name="Link_1_visual" type="mesh" mesh="Link_1_mesh" contype="0" conaffinity="0" group="2"/>
+        <geom name="Link_1_collision" class="collision" type="capsule" fromto="0 0 -0.025 0 0 0.025" size="0.042"/>
+
+        <body name="Link_2" pos="0 0 0" euler="1.5708 0 0">
+          <joint name="joint_2" type="hinge" axis="0 0 1" range="-1.48 4.62"/>
+          <inertial pos="0.11439 -0.00000066036 -0.11395" mass="18.247"
+                    fullinertia="0.025431 0.21741 0.20927 0.0000012399 -0.0016148 -0.00000002144"/>
+          <geom name="Link_2_visual" type="mesh" mesh="Link_2_mesh" contype="0" conaffinity="0" group="2"/>
+          <geom name="Link_2_collision" class="collision" type="capsule" fromto="0 0 -0.112 0.248 0 -0.112" size="0.047"/>
+
+          <body name="Link_3" pos="0.248 0 0">
+            <joint name="joint_3" type="hinge" axis="0 0 1" range="-3.05 3.05"/>
+            <inertial pos="0.13218 0.000012348 -0.0083734" mass="9.5247"
+                      fullinertia="0.0094701 0.088902 0.084947 0.00000074928 -0.0012353 0.00000006505"/>
+            <geom name="Link_3_visual" type="mesh" mesh="Link_3_mesh" contype="0" conaffinity="0" group="2"/>
+            <geom name="Link_3_collision" class="collision" type="capsule" fromto="0 0 0 0.228 0 0" size="0.045"/>
+
+            <body name="Link_4" pos="0.228 0.000011925 -0.115">
+              <joint name="joint_4" type="hinge" axis="0 0 1" range="-1.48 4.62"/>
+              <inertial pos="0.000000065068 -0.014052 0.0031614" mass="3.8728"
+                        fullinertia="0.0058546 0.0025893 0.0056328 -0.00000001505 -0.000000017928 -0.00019825"/>
+              <geom name="Link_4_visual" type="mesh" mesh="Link_4_mesh" contype="0" conaffinity="0" group="2"/>
+              <geom name="Link_4_collision" class="collision" type="capsule" fromto="0 -0.060 0 0 0.020 0" size="0.035"/>
+
+              <body name="Link_5" pos="0 -0.1175 0" euler="1.5708 0 0">
+                <joint name="joint_5" type="hinge" axis="0 0 1" range="-6.28 6.28"/>
+                <inertial pos="0.000000079256 0.0068655 -0.0029086" mass="4.3241"
+                          fullinertia="0.007903 0.0028281 0.0076792 0.0000000049677 0.00000001008 -0.00013094"/>
+                <geom name="Link_5_visual" type="mesh" mesh="Link_5_mesh" contype="0" conaffinity="0" group="2"/>
+                <!-- Link_5 covers the wrist's tool bore, so its proxy stops short of the
+                     gripper's working volume (the pads sweep through local y 0.06..0.08).
+                     Point c is where the real part is instead; see <contact> below. -->
+                <geom name="Link_5_collision" class="collision" type="capsule" fromto="0 -0.050 0 0 0.005 0" size="0.033"/>
+
+                <body name="Link_6" pos="0 0.1065 0" euler="-1.5708 0 0">
+                  <joint name="joint_6" type="hinge" axis="0 0 1" range="-6.28 6.28"/>
+                  <inertial pos="0.000049731 -0.00002965 -0.016372" mass="0.7876"
+                            fullinertia="0.00028184 0.00028506 0.00045635 -0.0000006975 -0.0000004464 0.00000060031"/>
+                  <geom name="Link_6_visual" type="mesh" mesh="Link_6_mesh" contype="0" conaffinity="0" group="2"/>
+                  <!-- Link_6 collision: flange disc, axis along the tool direction (local z) -->
+                  <geom name="Link_6_collision" class="collision" type="cylinder" size="0.026 0.007" pos="0 0 -0.015"/>
+                  <site name="tool0" pos="0 0 -0.035" size="0.008" rgba="0.9 0.1 0.1 1"/>
+
+                  <!-- Gripper attach point. MJCF has no "attach to site", so the gripper body
+                       fragment must be included from inside Link_6; its tool0 offset is baked
+                       into the gripper's root body pos. -->
+                  <include file="gripper_pg2.xml"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="actuator_joint_1" joint="joint_1" kp="1200" kv="120" ctrlrange="-6.28 6.28" forcerange="-2000 2000"/>
+    <position name="actuator_joint_2" joint="joint_2" kp="1200" kv="120" ctrlrange="-1.48 4.62" forcerange="-1500 1500"/>
+    <position name="actuator_joint_3" joint="joint_3" kp="1000" kv="100" ctrlrange="-3.05 3.05" forcerange="-1500 1500"/>
+    <position name="actuator_joint_4" joint="joint_4" kp="800" kv="80" ctrlrange="-1.48 4.62" forcerange="-1000 1000"/>
+    <position name="actuator_joint_5" joint="joint_5" kp="500" kv="50" ctrlrange="-6.28 6.28" forcerange="-1000 1000"/>
+    <position name="actuator_joint_6" joint="joint_6" kp="300" kv="30" ctrlrange="-6.28 6.28" forcerange="-1000 1000"/>
+    <!-- Jaw actuator of gripper_pg2.xml. MJCF only allows <actuator> at the document root,
+         and gripper_pg2.xml is spliced inside a <body>, so the actuator has to live here. -->
+    <position name="gripper_actuator" joint="gripper_jaw" kp="300" kv="5" ctrlrange="0 0.04" forcerange="-60 60"/>
+  </actuator>
+
+  <contact>
+    <exclude body1="Link_0" body2="Link_1"/>
+    <exclude body1="Link_1" body2="Link_2"/>
+    <exclude body1="Link_2" body2="Link_3"/>
+    <exclude body1="Link_3" body2="Link_4"/>
+    <exclude body1="Link_4" body2="Link_5"/>
+    <exclude body1="Link_5" body2="Link_6"/>
+    <!-- the gripper is rigidly bolted to the flange and its pads sweep through the volume
+         of the wrist links' proxies; a real part never self-collides with its own wrist -->
+    <exclude body1="Link_5" body2="gripper_pg2"/>
+    <exclude body1="Link_5" body2="gripper_finger_b"/>
+    <exclude body1="Link_6" body2="gripper_pg2"/>
+    <exclude body1="Link_6" body2="gripper_finger_b"/>
+  </contact>
+</mujoco>

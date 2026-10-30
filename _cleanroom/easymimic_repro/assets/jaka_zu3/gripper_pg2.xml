@@ -1,0 +1,35 @@
+<!-- Placeholder parallel two-finger gripper (PG2 style), included INSIDE Link_6 of robot.xml.
+
+     MJCF's <include> splices the CHILDREN of this file's root element (a single-<body> root
+     is silently dropped, two roots are silently dropped as well) - hence the
+     <gripper_pg2_fragment> wrapper. Its only child, <body name="gripper_pg2">, sits exactly on
+     site "tool0" (pos 0 0 -0.035 in Link_6) and inherits Link_6's frame.
+
+     In the gripper frame: +y = world +z (up), -y = approach direction (down), x = jaw axis.
+     Layout at jaw qpos = 0 ("closed"):
+       inner faces of the two pads at x = -0.00925 and x = +0.00925   -> gap 0.0185 m
+     A 0.0200 m cube is therefore preloaded 0.00075 m per side, and the position servo
+     (kp 300, ctrl 0) turns that interference into a steady squeeze force.
+
+     No <actuator> here: MJCF only accepts <actuator> at the document root, and this file is
+     spliced inside a <body>; an <actuator> written here is silently discarded (verified).
+     The jaw's position actuator is declared in robot.xml as "gripper_actuator". -->
+<gripper_pg2_fragment>
+
+  <body name="gripper_pg2" pos="0 0 -0.035">
+
+    <!-- palm plate: visual only (contype 0) so the grasp is decided by the pads alone -->
+    <geom name="gripper_palm" class="pg2_frame" type="box" size="0.026 0.024 0.012" pos="0 -0.028 0"/>
+
+    <!-- fixed finger: plain geom on the gripper body -->
+    <geom name="gripper_tip_fixed" class="pg2_pad" type="box" size="0.005 0.0225 0.011" pos="-0.01425 -0.0325 0"/>
+
+    <!-- moving finger: the gripper's single DoF, a 0 -> 0.04 m slide along the jaw axis -->
+    <body name="gripper_finger_b" pos="0.00925 -0.0325 0">
+      <joint name="gripper_jaw" class="pg2_jaw" type="slide" axis="1 0 0" range="0 0.04" limited="true"/>
+      <geom name="gripper_tip_moving" class="pg2_pad" type="box" size="0.005 0.0225 0.011" pos="0.005 0 0"/>
+    </body>
+
+  </body>
+
+</gripper_pg2_fragment>

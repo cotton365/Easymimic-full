@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Upstream JAKA Zu3 model: ~100 MB, redistribution licence unclear.
+# Fetch it with scripts/fetch_third_party.sh instead of committing it.
+third_party/
+
+# Local scratch space and run artefacts
+scratch/
+out/
+*.png

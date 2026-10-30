@@ -1,0 +1,6 @@
+<mujoco>
+  <body name="b_act" pos="0 0 -0.2"><joint name="j2" type="slide" axis="0 0 1" range="0 0.04"/>
+    <geom size="0.01"/>
+    <actuator><position name="a_in_body" joint="j2" kp="300" kv="5"/></actuator>
+  </body>
+</mujoco>

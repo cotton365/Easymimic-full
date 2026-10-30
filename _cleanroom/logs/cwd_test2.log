@@ -1,0 +1,105 @@
+libEGL warning: wayland-egl: could not open /dev/dri/renderD129 (No such file or directory)
+==============================================================================
+SCRIPT : /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/experiments/t1_verify.py
+CWD    : /home/zh/Desktop/EasyMimic/_cleanroom
+python : /home/zh/miniconda3/envs/mujoco/bin/python
+mujoco : 3.16.0 | numpy 2.4.6
+==============================================================================
+
+[1] load scene by ABSOLUTE path
+  scene      : /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/assets/jaka_zu3/scene_cube_bowl.xml
+  nq=14 nv=13 nu=7 nbody=13 ngeom=36 nmesh=7 njnt=8
+  robot.xml  : nq=7 nu=7  (6 arm hinges + 1 gripper slide)
+  [PASS] scene nu == 7 (6 arm + 1 gripper position actuator)
+  [PASS] robot subtree nq == 7 (6 arm hinges + 1 gripper slide)
+  scene nq   : 14 = 7 robot DoF + 7 cube free-joint qpos (3 pos + 4 quat).
+               a graspable cube must be a free body, so a scene-level nq==7 is
+               physically impossible; the invariant the brief states (6 arm +
+               1 gripper) is asserted on the robot subtree (mr.nq=7).
+
+[2] joints / actuators / meshes
+  joint 0  joint_1        type=3 qposadr=0 axis=[0. 0. 1.] range=[-6.2800, 6.2800]
+  joint 1  joint_2        type=3 qposadr=1 axis=[0. 0. 1.] range=[-1.4800, 4.6200]
+  joint 2  joint_3        type=3 qposadr=2 axis=[0. 0. 1.] range=[-3.0500, 3.0500]
+  joint 3  joint_4        type=3 qposadr=3 axis=[0. 0. 1.] range=[-1.4800, 4.6200]
+  joint 4  joint_5        type=3 qposadr=4 axis=[0. 0. 1.] range=[-6.2800, 6.2800]
+  joint 5  joint_6        type=3 qposadr=5 axis=[0. 0. 1.] range=[-6.2800, 6.2800]
+  joint 6  gripper_jaw    type=2 qposadr=6 axis=[1. 0. 0.] range=[0.0000, 0.0400]
+  joint 7  cube_free      type=0 qposadr=7 axis=[0. 0. 1.] range=[0.0000, 0.0000]
+  actuator 0  actuator_joint_1   joint=joint_1      kp=1200 kv=120 ctrlrange=[-6.28  6.28]
+  actuator 1  actuator_joint_2   joint=joint_2      kp=1200 kv=120 ctrlrange=[-1.48  4.62]
+  actuator 2  actuator_joint_3   joint=joint_3      kp=1000 kv=100 ctrlrange=[-3.05  3.05]
+  actuator 3  actuator_joint_4   joint=joint_4      kp=800 kv=80 ctrlrange=[-1.48  4.62]
+  actuator 4  actuator_joint_5   joint=joint_5      kp=500 kv=50 ctrlrange=[-6.28  6.28]
+  actuator 5  actuator_joint_6   joint=joint_6      kp=300 kv=30 ctrlrange=[-6.28  6.28]
+  actuator 6  gripper_actuator   joint=gripper_jaw  kp=300 kv=5 ctrlrange=[0.   0.04]
+  meshdir declared  : ../../third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes
+  resolved against  : /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/assets/jaka_zu3
+  -> absolute       : /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes
+  mesh 0 Link_0_mesh  /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes/Link_0.STL
+            exists=True verts=  3720 bbox_z=[-0.0645, 0.0645]
+  mesh 1 Link_1_mesh  /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes/Link_1.STL
+            exists=True verts=  3699 bbox_z=[-0.0628, 0.0627]
+  mesh 2 Link_2_mesh  /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes/Link_2.STL
+            exists=True verts= 13926 bbox_z=[-0.1702, 0.1672]
+  mesh 3 Link_3_mesh  /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes/Link_3.STL
+            exists=True verts=  8102 bbox_z=[-0.1831, 0.1219]
+  mesh 4 Link_4_mesh  /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes/Link_4.STL
+            exists=True verts=  3816 bbox_z=[-0.0601, 0.0675]
+  mesh 5 Link_5_mesh  /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes/Link_5.STL
+            exists=True verts=  5586 bbox_z=[-0.0743, 0.0667]
+  mesh 6 Link_6_mesh  /home/zh/Desktop/EasyMimic/_cleanroom/easymimic_repro/third_party/jaka-zu3-mujoco/assets/jaka_zu3_meshes/Link_6.STL
+            exists=True verts=  6614 bbox_z=[-0.0343, 0.0343]
+  [PASS] 7 STL meshes resolved to absolute existing files
+
+[3] grasp test: tool over the cube, jaw commanded closed, lift 0.10 m
+  timestep=0.0020 integrator=3 gravity=[ 0.    0.   -9.81]
+  home tool0 = [0.48621 0.0435  0.9055 ]
+  IK -> grasp [0.48621 0.0435  0.858  ] (tool axis vertical) |dp|=4.85e-08 |dR|=3.66e-08
+  [PASS] kinematic IK reaches the grasp pose over the cube
+  cube settled on table at z=0.80996  ncon=4
+  descended, tool0=[0.48614 0.0435  0.85799] (1.25 s)  jaw open=0.0400  ncon=4
+  3b closed: ctrl_jaw=0 -> jaw qpos=0.00137  cube z=0.80996  ncon=12
+     tip_fixed =[0.47199 0.0435  0.82544]
+     tip_moving=[0.50185 0.0435  0.82554]
+  lift commanded 0.100 m, then 1.50 s servo + 0.50 s hold = 2.00 s simulated
+  tool rise 0.10002 m
+  after lift: cube z=0.90802 (rise 0.09806) jaw=0.00137 ncon=8
+     tip_fixed =[0.47207 0.0435  0.92546]
+     tip_moving=[0.50194 0.0435  0.92558]
+     cube      =[0.48708 0.0435  0.90802]
+  jaw axis (world) = [9.9999e-01 2.7052e-05 3.9514e-03]
+  pad inner faces on jaw axis: 0.48072 .. 0.50059  (gap 0.01987 m)
+  cube centre on jaw axis    : 0.49066
+  [PASS] cube lifted >= 0.08 m (measured 0.09806 m)
+  [PASS] cube still between the fingers (proj 0.49066 inside (0.48072, 0.50059))
+  [PASS] cube still at fingertip height (dz=0.01744 m)
+  [PASS] pads are pressing the cube, not merely straddling it (gap 0.01987 m vs cube 0.02000)
+  [PASS] jaw servo settled closed on the cube (qpos 0.00137 m)
+
+[4] summary numbers
+  final cube z          : 0.90802 m  (start 0.80996, rise 0.09806)
+  gripper_tip_fixed     : [0.47207 0.0435  0.92546]
+  gripper_tip_moving    : [0.50194 0.0435  0.92558]
+  gripper_jaw axis      : [1. 0. 0.]
+  gripper_jaw range     : [0.0000, 0.0400] m  (qpos now 0.00137)
+  pad half-size         : fixed=[0.005  0.0225 0.011 ] moving=[0.005  0.0225 0.011 ]
+  pad pos (local)       : fixed=[-0.01425 -0.0325   0.     ] moving=[0.005 0.    0.   ]
+  pad condim/friction   : 4 / [1.5   0.02  0.002]
+  pad contype/conaff    : 1 / 1
+  collision geoms (group 3):
+    Link_0_collision     type=5 size=[0.056 0.043 0.   ] pos=[0.    0.    0.043]
+    Link_1_collision     type=3 size=[0.042 0.025 0.   ] pos=[0. 0. 0.]
+    Link_2_collision     type=3 size=[0.047 0.124 0.   ] pos=[ 0.124  0.    -0.112]
+    Link_3_collision     type=3 size=[0.045 0.114 0.   ] pos=[0.114 0.    0.   ]
+    Link_4_collision     type=3 size=[0.035 0.04  0.   ] pos=[ 0.   -0.02  0.  ]
+    Link_5_collision     type=3 size=[0.033  0.0275 0.    ] pos=[ 0.     -0.0225  0.    ]
+    Link_6_collision     type=5 size=[0.026 0.007 0.   ] pos=[ 0.     0.    -0.015]
+
+[5] offscreen render
+  frame shape=(480, 640, 3) dtype=uint8 mean=71.22 min=0 max=234
+  [PASS] Renderer produced a 480x640x3 RGB frame
+  [PASS] frame is not blank (mean 71.22)
+
+==============================================================================
+RESULT: ALL CHECKS PASSED
