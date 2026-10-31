@@ -298,3 +298,21 @@ invalid qpos size, expected length 14
 | 重复导出 | 同上再跑一次 | 中文报错"输出目录已存在"，exit 1 |
 
 真数据（out/act_demos 20 条）到位后，把文档里的 out/act_demos_fixture → out/act_demos、act_pick_cube_fixture → act_pick_cube、act_train_smoke → act_train 换掉即可，命令结构不用改。
+
+---
+
+## 6. 真数据实测记录（out/act_demos 20 条）
+
+| 环节 | 命令/配置 | 实测 |
+|---|---|---|
+| 导出 | export_lerobot_dataset.py --demos out/act_demos --out data/lerobot/act_pick_cube | num_episodes=20 num_frames=2160，44 MB |
+| 读回 | LeRobotDataset(root=data/lerobot/act_pick_cube) | len=2160、fps=20、state (7,)、action (7,)、两路 (3,256,256) |
+| CPU 冒烟 | 200 步 / batch 8 / chunk 32 / n_action 8 / device cpu | 约 4 分钟，checkpoint 落在 out/act_train_cpu200/checkpoints/last |
+| 开环评测 | 同上，--ckpt out/act_train_cpu200 --demos out/act_demos | 总体 MSE 0.020980 vs mean 0.034825 / persis 0.000108 → FAIL，exit 1 |
+
+persistence 基线（复制上一帧动作）在 20 Hz 的平滑航点示教上极强：末段速度趋零时相邻动作几乎相同。
+200 步的模型只赢过 mean 基线、输给 persistence 是预期结果。这也说明「判据 = 同时低于两个基线」
+在轨迹内插值这件事上没有难度，真要衡量泛化得靠留出 episode 或闭环评测。
+
+另：§4 提到的 <key name="home" qpos="7 个数"> 与 nq=14 不匹配，是 lerobot-eval 闭环评测加载本仓库场景的
+第一个硬报错（mujoco 3.1.6 直接拒绝加载 keyframe）。修它属于 assets/ 侧改动，留给下一轮。
