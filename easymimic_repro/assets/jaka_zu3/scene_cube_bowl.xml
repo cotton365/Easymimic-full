@@ -14,6 +14,14 @@
   </visual>
 
   <worldbody>
+    <!-- Fixed front camera: 0.65 m in front of and 0.38 m above the look-at point (0.75 m away),
+         aimed at (0.28, 0.03, 0.86) with fovy 50 deg, so a 256x256 frame covers +-0.35 m there: the
+         whole arm (base x = -0.002 .. tool x = 0.474) fits and the 3 cm cube still gets ~11x15 px.
+         xyaxes = the camera's own +x/+y in world, computed as x = up x z, y = z x x with
+         z = (pos - lookat)/|..|. -->
+    <camera name="front" pos="0.28000 -0.62000 1.24000" xyaxes="1 0 0 0 0.50469 0.86329"
+            fovy="50"/>
+
     <!-- table: 1.20 x 1.00 x 0.04 box, top face exactly at z = 0.80 -->
     <body name="table">
       <geom name="table_top" type="box" size="0.60 0.50 0.02" pos="0.35 0.04 0.78"

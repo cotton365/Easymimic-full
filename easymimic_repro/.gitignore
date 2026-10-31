@@ -12,3 +12,4 @@ third_party/
 scratch/
 out/
 *.png
+data/

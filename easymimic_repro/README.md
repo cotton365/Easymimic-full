@@ -425,3 +425,29 @@ mediapipe 0.10.21 / opencv 4.11.0。这两个包会把 numpy 降到 1.26.x（med
 摄像头取帧这条链路在本机无法验证：沙箱里没有 /dev/video*，打不开设备节点。已验证的是
 「依赖缺失 → 打印准确的 pip 命令并退出 1」「--probe 打不开设备 → 4 条中文排查提示并退出 1」
 「--selftest 全绿并给出末端误差数值」。第一次上台请按 12.2 的顺序，先跑第 1 步。
+
+
+## 13. ACT 示教数据生成
+
+`experiments/gen_act_dataset.py` 复用 §8/§12 里同一个 `Replayer`，用 `configs/waypoints_cube_lift.json`
+的 8 维 EE 航点表逐 control tick 记录 qpos、实际下发目标、时间戳与两个相机的 RGB 帧，供下游训练 ACT。
+
+```bash
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/gen_act_dataset.py --seed 0
+/home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_dataset.py     # ALL CHECKS PASSED
+```
+
+- 输出：`out/act_demos/ep000 … ep019/{front,wrist}/000000.png …`（各 108 帧，256×256，正向不颠倒）
+  + `data.npz`（qpos (108,7)、act (108,7)、t、cube_pos、cube_quat、rise_m、slip_m，全部 float64）
+  + `meta.json`，顶层 `index.json` 与 `summary.json`（尝试次数、逐条 rise/slip/IK 残差）。
+- 20 条耗时约 19 s（20 Hz，108 帧/条 ≈ 5.35 s 示教时长，单进程含渲染）；`--no-render` 只跑数据。
+- 随机化：方块 xy 在 `[-0.020, 0.020] × [-0.005, 0.005] m`（本轮不随机 yaw），整张航点表平移同样的量。
+  该范围由 ±0.030/±0.006 m 的 35 组扫描确定：全部抬得起来（rise 0.1183–0.1193 m），收到 ±0.02/±0.005 留余量。
+- 实测：20/20 成功、0 次重采；rise 0.11834–0.11896 m，slip ≤ 0.000528 m，IK 位置残差 ≤ 1.0 mm（阈值 2 mm）。
+- 失败重采：rise < 0.08 m 或 IK 残差 > 2 mm 即丢弃并重新随机；把范围放大到 ±0.30/±0.05 m
+  （`scratch/retry_demo.py`）可复现该分支：2 条用了 18 次尝试，两类拒绝理由都出现。
+- 确定性：同 `--seed` 两次生成的首/末帧 qpos 逐位一致（20 条 npz 的全部数组 `array_equal`）。
+- 相机只增 `<camera>`、不动任何几何/质量/关节/执行器：`front`（worldbody，pos 0.28 -0.62 1.24，fovy 50）
+  与 `wrist`（`gripper_base`，pos 0.0172 -0.04 0.088，fovy 75）。样本帧见 `out/act_cameras/{front,wrist}.png`。
+  加相机后 `experiments/t1_verify.py` 与 `experiments/pose_replay.py --no-render` 的物理数值逐行不变
+  （rise 0.11861 m、slip 0.000547 m、末帧 cube 距 tool0 0.00117 m），只有墙钟时间不同。

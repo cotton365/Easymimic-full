@@ -52,6 +52,15 @@
     <!-- upstream inertial block (jaka_zu3_mujoco.xml:87); total 0.45 kg fixed + 0.08 kg jaw -->
     <inertial pos="0.01 0 0.022" mass="0.45" diaginertia="0.00055 0.00075 0.00070"/>
 
+    <!-- Wrist camera: eye-in-hand, looks along the -y flank into the pinch point.  There is no
+         free space anywhere else around the fingers: the housing mesh reaches z = 0.0951 (the
+         pads start at z = 0.119, so the only axial pocket is that 24 mm plate gap, where the
+         30 mm cube fills the frame) and both +-x flanks are the fins themselves.  pos is in
+         this body frame, +z toward the fingertips; the look-at point is the pinch
+         (0.0172, -0.0035, 0.127).  xyaxes: camera +x = body -x, camera +y = body (0 .73 -.68),
+         which is world +z, so the frames come out upright.  fovy 75 deg. -->
+    <camera name="wrist" pos="0.01720 -0.04000 0.08800" xyaxes="-1 0 0 0 0.73012 -0.68332"
+            fovy="75"/>
     <geom name="gripper_housing" class="gr_visual" type="mesh" mesh="gripper_fixed_housing_mesh"
           rgba="0.86 0.45 0.08 1"/>
     <geom name="gripper_hardware_a" class="gr_visual" type="mesh" mesh="gripper_fixed_hardware_a_mesh"
