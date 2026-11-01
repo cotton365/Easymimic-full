@@ -316,3 +316,36 @@ persistence 基线（复制上一帧动作）在 20 Hz 的平滑航点示教上�
 
 另：§4 提到的 <key name="home" qpos="7 个数"> 与 nq=14 不匹配，是 lerobot-eval 闭环评测加载本仓库场景的
 第一个硬报错（mujoco 3.1.6 直接拒绝加载 keyframe）。修它属于 assets/ 侧改动，留给下一轮。
+
+## 7. 闭环 rollout 与 MuJoCo 窗口回放
+
+策略在环里真的驱动机械臂（不是开环比 MSE）：每一拍取两路相机 + `qpos[:7]` 喂策略，
+它的 7 维动作直接写进 `data.ctrl[:7]`，跑 25 substeps × 0.002 s = 20 Hz。
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+export HF_HOME=$PWD/data/_scratch/hf_home HF_DATASETS_CACHE=$HF_HOME/datasets
+export DISPLAY=:1
+PY=/home/zh/miniconda3/envs/lerobot/bin/python
+
+# 立刻看：一条 trial 跑完后立刻弹出 MuJoCo 窗口，20 Hz 回放，关窗口才退出
+$PY experiments/act_rollout.py --trials 1 --viewer
+
+# 三种起点（决定你看到的是"照轨迹走"还是"真在纠偏"）
+$PY experiments/act_rollout.py --trials 1 --viewer --start approach   # 训练分布，10/10
+$PY experiments/act_rollout.py --trials 1 --viewer --start nominal    # 臂不动只挪方块，4/10
+$PY experiments/act_rollout.py --trials 1 --viewer --start keyframe   # home 起步，3/10
+```
+
+`--viewer` 的两段式设计（不是偷懒，是 GL 限制）：一个进程里同时持有 viewer 的 GL 上下文和
+相机用的离屏上下文在这台机器上不可靠，所以先无头把策略跑完（6~7 ms/拍），再另起一个只有
+viewer 的上下文按 20 Hz 回放记录的 `qpos`（14 维：6 轴 + 夹爪 + 方块 freejoint）。回放是
+**播记录**，不是第二次仿真，所以不会发散；看到的就是策略跑出的那条轨迹，方块和接触都在。
+
+`--viewer-passes N` 控制循环遍数（0 = 一直循环到关窗口）。`--no-video` 可省掉 mp4 编码。
+
+产物：`out/act_rollout/summary.json`（每 trial 的 `dx dy rise_m slip_m grasp_tick outcome`）、
+`trial_XX.mp4`（512×256，front|wrist 并排）、每 25 拍一张 PNG。
+`outcome` 取值：`diverged / no_motion / gripper_never_closed / slipped_out / not_lifted /
+lift_insufficient / lost_after_lift / success`。
+
