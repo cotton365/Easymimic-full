@@ -345,6 +345,235 @@ EXIT=1
 
 ---
 
+## G. 8 维 ACT 策略闭环验收（真 checkpoint，50 次）
+
+> 与 §A/§B/§C 不同，这一节不是资产或解码链的自测，而是**训出来的策略**在闭环里跑出的结果。
+> checkpoint = `out/act_train_ee/checkpoints/last/pretrained_model`（= `002000`，2000 步，末段 loss 0.911）。
+> 环境 = `~/miniconda3/envs/lerobot/bin/python`（torch + mujoco 3.1.6），`--device cpu`，策略跑满 200 拍或提前判成功。
+
+```
+export HF_HOME=$PWD/data/_scratch/hf_home HF_DATASETS_CACHE=$HF_HOME/datasets
+/home/zh/miniconda3/envs/lerobot/bin/python experiments/act_rollout.py \
+  --ckpt out/act_train_ee/checkpoints/last/pretrained_model \
+  --trials 10 --seed <0..4> --device cpu --out scratch/ee_seed<n> --json-only --no-video
+```
+
+| seed | 成功 | rise (m) | slip 最大 (m) | tool offset 最大 (m) |
+|---|---|---|---|---|
+| 0 | 10/10 | 0.107243 – 0.12316 | 0.003552 | 0.012805 |
+| 1 | 10/10 | 0.1119 – 0.1235 | 0.00525 | 0.00894 |
+| 2 | 10/10 | 0.1075 – 0.1231 | 0.00370 | 0.01345 |
+| 3 | 10/10 | 0.1072 – 0.1238 | 0.00338 | 0.01359 |
+| 4 | 10/10 | 0.1041 – 0.1235 | 0.00381 | 0.01665 |
+
+5 个 seed × 10 次 = **50/50 成功**；`ik_pos_err_max` 全程 ≤ 9.98e-04 m（0.45 deg），`ik_fallback_ticks` /
+`ik_fail_ticks` / `ik_limit_ticks` / `bad_action_ticks` 全为 0，`infer_ms_mean` 1.3 ms/拍，seed 0 十次
+总 wall 8.7 s。seed 1 那一次 `slip 0.00525` 是 50 次里唯一越过 §C 的 5 mm 记录线的一次。
+
+### G1. 同一组扰动下 8 维 vs 7 维（可配对）
+
+同一个 `--seed` 生成同一组方块初始偏移，所以两边是**逐次配对**的比较（`legacy/act_rollout_joint7.py`
+用 `out/act_train/checkpoints/last`，即旧的关节 7 维策略）：
+
+| 指标 | 8 维（EE） | 7 维（关节） |
+|---|---|---|
+| 成功 | 10/10 | 10/10 |
+| slip 均值 | **2.80 mm** | 6.23 mm |
+| slip 最大 | **3.55 mm** | 9.50 mm |
+| slip > 5 mm 的次数 | **0/10** | **6/10** |
+| rise | 0.1072 – 0.1232 m | 0.1262 – 0.1272 m |
+| tool offset 最大 | 12.81 mm | 3.00 mm |
+
+7 维逐次 slip（mm）：8.3 / 5.1 / 8.0 / 9.5 / 2.4 / 4.8 / 4.9 / 3.8 / 9.2 / 6.3。
+8 维逐次 slip（mm）：3.3 / 1.2 / 3.5 / 3.0 / 2.8 / 3.3 / 2.9 / 3.6 / 3.3 / 1.1。
+
+**要点：`classify()` 判成功只查 rise 与 tool offset，从不查 slip**（`experiments/act_rollout.py:41-42`、
+`:140` 起的 `classify()` 只比较 `rise_m` 与 `tool_offset_m`；`max_slip_m` 只写进 `criteria` 字段留档）。
+所以「10/10」的意思是「10 次都抬起来了」，不是「10 次都抓干净」——按 5 mm 抓取质量线算，旧 7 维策略是
+4/10，8 维是 10/10。**比成功率之前先看 slip，否则成功率是虚的。**
+
+### G2. 开环评测仍是 FAIL，但它 FAIL 在一个通道上
+
+`scripts/eval_act_openloop.py --demos out/act_demos_ee --holdout-ep last`（107 步，留出 ep019）：
+
+| | model | mean 基线 | persistence 基线 |
+|---|---|---|---|
+| overall MSE | 0.000317 | 0.025268（**79.8x**） | 0.000060（**0.190x**） |
+| 其中 `g` 通道 | 0.002496 | 0.199308 | 0.000467 |
+
+- 出口码 1 / `判定: FAIL` 是**判据设计**的结果，不是策略退化：`g` 一个通道就占了 overall 的
+  **98.4%**（0.002496/8 ≈ 0.000312 vs 0.000317）。剔掉 `g`，其余 7 维平均 **5.7e-06**，persistence
+  是 1.9e-06 —— 位姿通道已经贴到 persistence 的量级。
+- 同一判据下 7 维基线是 0.001403，8 维是 0.000317，**好 4.4 倍**。
+- 机制：episode 只有 108 拍，`chunk_size=100 / n_action_steps=100` 等于一次预测吃掉几乎整条轨迹，
+  而 `g` 是只在第 ~46 拍翻转的阶跃；模型给的是被平滑过的翻转。§7 的 persistence 说明在这里同样适用。
+
+### G3. 已知边界（别把这些当已验证）
+
+- **`g` 头系统偏出 `[0,1]`**：闭环里 **1305/2000 拍（65%）的 `g` 被 `decode_pose8` 的 clip 拉回**。
+  行为上等于饱和（顶到全开/全夹），所以当前无害；但说明 `g` 头没学会落在边界内，将来要做精细开度
+  （软物、多档夹持）必须处理。
+- **8 维夹得偏中心但夹得紧**：tool offset 12.81 mm vs 旧 3.00 mm（判据 40 mm 仍安全），slip 反而小
+  2.2 倍。只观察到现象，没有做接触力分析。
+- **只有位姿随机化，没有视觉随机化**：`RANDOM_X_M=0.02 / RANDOM_Y_M=0.005` 只移动方块，光照、纹理、
+  噪声一律固定。仿真训练 → 真机执行时这一层是空的，需要单独做域差测量（比如挡掉一路相机看掉多少成功率）。
+- **单场景、单方块、单物体尺寸**；`approach` 起点固定；没有失败样本，所以看不到失败模式。
+- 全部在 CPU 上跑；`--video` 未开，本节不含 PNG。
+
+---
+
+## H. 放置任务（夹起 → 放进碗里）验收
+
+> 这一节只有**数据层 + 回放层**，没有训练，也没有策略在环。两条来源分开写：
+> **H1 是上游（建表的人）用自己的 scratch 探针跑出来的数字**，我一行代码都没参与；
+> **H2 是我在本仓库用正式 CLI 复跑的数字**。两边不是同一份脚本，吻合是结论，不吻合就得查。
+
+### H1 上游实测（表由上游建好并验证，我未改任何数字）
+
+表 `configs/waypoints_cube_place.json`：8 航点、全部 `rotvec=[0,π,0]`、@20 Hz 共 **181 tick**
+（`approach → descend → close → lift → carry → lower → release → retreat`，release 高度 **0.870 m**）。
+碗几何：中心 `(0.300, -0.200)`、内半径 0.045 m、壁顶 z=0.840、底 z=0.802；方块静止中心 z=0.817。
+
+| 项 | 上游数字 |
+|---|---|
+| 随机偏移下入碗 | **20/20** |
+| `bowl_dxy`（末帧方块 xy 到碗心） | 0.0021 – 0.0046 m |
+| 搬运全程是否掉块 | 不掉（末段 `joint_7` 仍 0.222） |
+| IK 残差 | ≤ 9.9e-04 m |
+| `rise_m` | ≈ +0.0020 m（放置任务抬升本来就≈0） |
+
+### H2 本次复跑（本仓库正式 CLI，2026-11，CPU）
+
+生成（mujoco env，**20/20 accepted，29.67 s**）：
+
+```
+$ /home/zh/miniconda3/envs/mujoco/bin/python experiments/gen_act_dataset.py \
+    --table configs/waypoints_cube_place.json --out out/act_demos_place
+20/20 episodes in 29.7 s, 20 attempts, rise 0.00196..0.00196 m, slip <= 0.316043 m
+ik residual <= 9.97e-04 m, FK check <= 0.00e+00 m
+in_bowl 20/20, bowl_dxy 0.00207..0.00466 m, hold_err <= 0.00119 m      EXIT=0
+```
+
+| 项 | 本次数字 | 门槛 | 与 H1 对照 |
+|---|---|---|---|
+| 条数 / `num_frames` | 20 条，每条 **181**（集合 `{181}`） | 20 / 181 | 一致 |
+| `in_bowl` | **20/20 true** | 全 true | 一致 |
+| `bowl_dxy_m` | **0.002069953829557699 – 0.004658764143423505** | ≤ 0.005 | 与 0.0021–0.0046 吻合 |
+| `hold_err_m` | max **0.001191087275688795** | ≤ 0.002 | H1 未报此量 |
+| `ik_err` max | **0.0009969513475666465** | ≤ 1.2e-3 | 与 ≤9.9e-04 吻合 |
+| `rise_m` | 0.0019600533116050922 – 0.0019600533116057584 | 不参与判据 | 与 ≈+0.0020 吻合 |
+| `slip_m` max | **0.31604300775805133** | — | 见下方注意 |
+
+> **`slip_m` 在 place 里不是抓取质量**：它沿用 lift 的定义（夹紧之后的位移），而放置任务要把方块搬
+> ~0.4 m，所以 0.28–0.32 m 是**正常值**，别拿 5 mm 线去卡。抓取质量看 `hold_err_m`（≤1.19 mm）。
+
+导出（lerobot env，51 s）：`data/lerobot/act_pick_place`，读回 **num_episodes=20 / num_frames=3620**、
+`action (8,)`、`observation.state (8,)`、`meta/info.json total_frames 3620`、
+`meta/tasks.parquet` 单条任务 `pick up the red block and put it in the bowl`。
+
+回放（mujoco env，1.9 s，不吃 policy）：
+
+```
+$ /home/zh/miniconda3/envs/mujoco/bin/python experiments/act_rollout.py \
+    --replay-demos out/act_demos_place --task place --json-only --no-video \
+    --out scratch/rollout_place_replay
+summary: 20 trials, 20 success, rate 1.00                             EXIT=0
+```
+
+| 项 | 本次数字 | 门槛 |
+|---|---|---|
+| 成功 | **20/20**（`outcomes {"success": 20}`） | 20/20 |
+| `bowl_dxy_m` | **0.004606 – 0.004751** | ≤ 0.005 |
+| `in_bowl` | 20/20 true | 全 true |
+| `hold_err_m` max | **0.0012182886434837516** | ≤ 0.002 |
+| `ik_pos_err_max_m` | **0.0009992832630732616** | ≤ 2e-3 |
+| 末拍指令 g | 20/20 = **1.0** | 测量值（判据只看方块是否脱离 tool0） |
+| `state_dev0_max` | **0.0** | 0（首拍观测自洽） |
+
+> 回放的 `bowl_dxy`（0.0046–0.0048）比生成的（0.0021–0.0047）**略大**：同一条位姿由 IK 走出不同的
+> 关节解，落点跟着差零点几毫米，仍在 5 mm 门内。这不是数据不一致。
+
+**lift 通路没被碰**：同一条回放命令把 `--task` 去掉（默认 `lift`）跑 `out/act_demos_ee`，`summary.json`
+的顶层字段集合与改动前**逐项相同**（无新增/缺失字段），值只差 `per_trial` 里的 `ik_s/ik_ms/wall_s/pngs`
+计时与渲染字段；20/20 成功、rise 0.1175–0.1187 m。旧产物三处的文件数与总字节数改动前后完全一致：
+`out/act_demos_ee` 4362 / 45815859，`data/lerobot/act_pick_cube_ee` 5 / 45330518，
+`out/act_train_ee` 44 / 2478498105。
+
+测试（两条都是自测脚本，不是 pytest）：
+
+| 命令 | checks | 退出码 |
+|---|---|---|
+| `tests_ee/test_act_dataset.py`（默认 lift 目录） | 14317 | 0 |
+| `tests_ee/test_act_dataset.py --dir out/act_demos_place --episodes 20` | 23425 | 0 |
+| `tests_ee/test_act_rollout.py --place-summary scratch/rollout_place_replay/summary.json` | 546 | 0 |
+
+新增的 place 断言里有一条**负向性质**：造一个 `rise_m=0.12`（足够过 lift 判据）但 `in_bowl=False` 的
+record，`classify_place()` 必须判 `not_in_bowl`，而同一个 record 喂给 lift 的 `classify()` 是 `success`
+—— 判据不认 `rise`，这条就是证据。
+
+### H3 负向变异（证明断言真的在管人管的事）
+
+| 变异 | 结果 |
+|---|---|
+| `ANCHORED_LABELS` 改成 `()` | **EXIT=1**，`AssertionError: shifted_table: 'carry' moved by (+0.0170, +0.0040), expected (+0.0000, +0.0000) - the bowl does not follow the cube offset` |
+
+变异后已用备份还原，`md5sum` 与备份逐字节相同，重跑回到 546 checks / EXIT=0。
+`tests_ee/test_act_dataset.py` 不 import 生成器（只验磁盘产物），所以这个变异对它无效是**设计如此**。
+
+### H4 这一节不能证明什么
+
+- **没有训练、没有策略闭环**：`out/act_train_place` 不存在，`--task place` 的策略路径一次都没跑过。
+  20/20 是**示教表回放**，证明的是表 + 物理 + 判据自洽，不证明 ACT 能学会。
+- `--viewer` 的窗口**没有真的打开**（用户桌面上不许弹窗），只做了 stub：把 `play_in_viewer` 换成记录器，
+  断言不带 `--viewer` 时**不被调用**、带 `--viewer` 时**被调用一次**且参数为
+  `(SCENE, 1 条 (181,14) 的 trace, CONTROL_HZ, --viewer-passes=3)`。
+- 随机化只有方块 xy（±20/±5 mm）与方块 yaw；碗固定、光照/纹理/相机噪声全固定，`in_bowl` 因此只是个
+  几何判据，不代表真机上"放进去"的成功率。
+- 只有一种方块尺寸、一个固定碗；`release` 高度 0.870 m 是手调的，没有扫过参数。
+
+### H5 真策略闭环（20k 训练，10 个检查点 × 20 次）与判据修正
+
+前面 H1–H4 说的都是**脚本化示教**（表 + IK + 物理）。这一节是**真 checkpoint**：`out/act_train_place_20k`
+（20000 步，loss 平台 ≈2.37、`grdn` ≈30 不降），10 个检查点各跑 20 次、同 20 组扰动、seed 0、CPU。
+
+判据先后有两版，差别是本节的核心：
+
+| 版本 | "已松手"的证据 | step 6000 的结果 |
+|---|---|---|
+| 旧（作废） | 末拍**指令** `g ≥ 0.9` | **0/20**（`never_released` 20） |
+| 新（现行） | 末帧方块中心到 `tool0` 距离 ≥ `RELEASE_SEP_M = 0.05 m`（松手后退开的物理证据） | **20/20** |
+
+旧判据错在把「策略自己报的开度」当行为证据：那 20 次里末拍 `g` 只有 **0.639–0.766**，而方块
+实际离 `tool0` **0.111–0.123 m**、全部躺在碗里（`in_bowl` 20/20）。g 头系统性偏低是训练出来的
+性质，不是失败。现行 `classify_place`（`experiments/act_rollout.py`）只查物理脱离 + `in_bowl`，
+`cmd_g_last` 降级为测量值。
+
+| step | 002000 | 004000 | **006000** | 008000 | 010000 | 012000 | 014000 | 016000 | **018000** | 020000 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 成功 | 0/20 | 0/20 | **20/20** | 5/20 | 0/20 | 0/20 | 7/20 | 5/20 | **20/20** | 14/20 |
+
+多 seed 复核（每检查点 4 个 seed × 20 次）：
+
+| 检查点 | 成功 | 最差 `bowl_dxy_m` | 最差 `hold_err_m` | 备注 |
+|---|---|---|---|---|
+| 006000 | **80/80 (100%)** | 0.0295 | 0.0251 | 无一次失手 |
+| 018000 | 77/80 (96%) | 0.2824 | 0.2948 | 3 次根本没抓到（`rise_peak` 0.001–0.004 m） |
+
+- **训练不单调**：0 → 0 → 20/20 → 5 → 0 → 0 → 7 → 5 → 20/20 → 14/20。同一个 run 里 step 6000 与
+  18000 都好、10000–12000 全废，而 loss 一直卡在 2.37。选权重必须按闭环扫描选，不能看 loss 或
+  只看 `last`。
+- **`bowl_dxy` 与 `hold_err` 的尺度变了**：策略放置的横向误差到 **29.5 mm**（仍在碗内，碗内半径
+  45 mm，判据半径 30 mm），而脚本化示教只有 4.6 mm；`hold_err` 到 **25.1 mm**（示教 1.2 mm）。
+  所以 `tests_ee/test_act_rollout.py` 对 policy 与 replay 用两个门：`mode=replay` 走 0.005 m /
+  0.002 m（表生成的验收门），`mode=policy` 走 `IN_BOWL_RADIUS_M` / 0.030 m。
+- 测试计数：`test_act_rollout.py --place-summary scratch/p20k2_006000/summary.json` → 547 checks；
+  默认（重新生成的 `out/act_rollout_place/summary.json`）→ 339 checks，均 `ALL CHECKS PASSED` EXIT=0。
+
+这一节**不能**证明：真机上的放置成功率；换碗/换方块尺寸后的泛化；视觉域差（训练与评测同一台
+渲染器、同一光照）；`--viewer` 那条路径我只做了函数级 stub（用户自己开窗）。
+
+---
+
 ## 历史验收（改资产之前的复跑记录）
 
 > 下面这些数字来自 **T7 换真夹爪之前**的占位夹爪资产（`gripper_pg2.xml`：slide `0..0.04 m`、`kp=300 kv=5`、`site tool0` 在法兰上）。同一条命令现在跑出来的数字与它们不同，**不可复现是预期的**，保留只为记录当时的判据与踩过的坑。

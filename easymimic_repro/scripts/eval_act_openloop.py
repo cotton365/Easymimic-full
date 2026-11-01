@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 """ACT 开环推理评测：在留出 episode 上逐步推理，与两个基线比 MSE/MAE。
 
+口径是 8 维 EE 接口 [x,y,z,qw,qx,qy,qz,g]（见 docs/ACT_PIPELINE.md §8）：state 取该拍
+动作执行前的 tool0 位姿+夹爪开度，action 取执行后位姿+该拍指令 g。八维单位不同（米 /
+无量纲 / 无量纲），overall MSE 是他们等权平均，只能当相对比较看；逐维表格才是诊断依据。
+
 基线:
   1) mean  : 全数据集动作均值 -> 常数预测
   2) persis: 复制上一帧动作 (persistence)
@@ -24,7 +28,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-DIM_NAMES = [f"joint{i}" for i in range(1, 7)] + ["gripper"]
+DIM_NAMES = ["x", "y", "z", "qw", "qx", "qy", "qz", "g"]
+STATE_DIM = 8
+ACTION_DIM = 8
 IMAGE_SIZE = 256
 
 
@@ -32,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", type=Path, required=True,
                    help="checkpoint 路径：训练输出根目录或 .../pretrained_model 目录")
-    p.add_argument("--demos", type=Path, default=Path("out/act_demos"), help="示教目录，含 index.json")
+    p.add_argument("--demos", type=Path, default=Path("out/act_demos_ee"), help="示教目录，含 index.json")
     p.add_argument("--holdout-ep", type=str, default="last", help="留出 episode：'last'、序号 (1) 或名字 (ep001)")
     p.add_argument("--device", type=str, default="cpu", help="推理设备，本沙箱只能用 cpu")
     return p.parse_args()
@@ -77,10 +83,24 @@ def load_rgb(path: Path) -> torch.Tensor:
     return t.unsqueeze(0)
 
 
-def load_episode(ep_dir: Path, cams: list[str]) -> dict:
+def load_pose8(ep_dir: Path) -> dict:
+    """读一条 episode 的 8 维数组；缺键（旧 7 维示教）或维度不符就在读第一帧之前退出。"""
     data = np.load(ep_dir / "data.npz")
-    state = data["qpos"].astype(np.float32)
-    action = data["act"].astype(np.float32)
+    for key in ("pose8_state", "pose8_action"):
+        if key not in data:
+            sys.exit(f"[eval] 错误: {ep_dir.name}/data.npz 缺少 '{key}'"
+                     f"（旧 7 维示教没有 EE 数组，请用 experiments/gen_act_dataset.py 重新生成）")
+    state = data["pose8_state"].astype(np.float32)
+    action = data["pose8_action"].astype(np.float32)
+    if state.shape[1] != STATE_DIM or action.shape[1] != ACTION_DIM:
+        sys.exit(f"[eval] 错误: {ep_dir.name} 形状为 {state.shape}/{action.shape}，"
+                 f"要求 (N,{STATE_DIM})/(N,{ACTION_DIM})")
+    return {"state": state, "action": action}
+
+
+def load_episode(ep_dir: Path, cams: list[str]) -> dict:
+    arrays = load_pose8(ep_dir)
+    state, action = arrays["state"], arrays["action"]
     n = state.shape[0]
     frames = {cam: sorted((ep_dir / cam).glob("*.png"), key=lambda p: int(p.stem)) for cam in cams}
     for cam, fs in frames.items():
@@ -107,8 +127,10 @@ def main() -> None:
     episodes, holdout = pick_holdout(demos, args.holdout_ep)
 
     # 1) 全数据集动作均值（含留出 episode，符合"全数据集均值"口径）
-    all_actions = np.concatenate([np.load(ep / "data.npz")["act"].astype(np.float32) for ep in episodes])
+    all_actions = np.concatenate([load_pose8(ep)["action"] for ep in episodes])
     mean_action = all_actions.mean(axis=0).astype(np.float32)
+    if mean_action.shape != (ACTION_DIM,):
+        sys.exit(f"[eval] 错误: 均值基线形状 {mean_action.shape}，要求 ({ACTION_DIM},)")
 
     hold = load_episode(holdout, cams)
     gt = hold["action"]
@@ -150,8 +172,8 @@ def main() -> None:
             action = policy.select_action(batch)
         action = postprocessor(action)
         preds.append(action.squeeze(0).detach().cpu().numpy().astype(np.float32))
-    pred = np.stack(preds)          # (n-1, 7)
-    target = gt[1:]                  # (n-1, 7)
+    pred = np.stack(preds)          # (n-1, 8)
+    target = gt[1:]                  # (n-1, 8)
     mean_pred = np.tile(mean_action, (n - 1, 1))
     persis_pred = gt[:-1]            # 复制上一帧动作
 

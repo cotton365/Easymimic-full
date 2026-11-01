@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """Contract test for the scripted ACT dataset written by experiments/gen_act_dataset.py.
 
-Pure numpy + file inspection: no mujoco, no rendering, no imports from src/ - the point is
-that the artefact on disk can be checked by a machine that cannot run the simulator.
+Needs numpy + mujoco, and reads the two constants it must not invent (GRIPPER_CONFIG, the
+scene path) straight out of the sources the generator uses. Nothing here calls the
+generator or imports its private helpers: the point is that the artefact on disk can be
+checked on its own.
 
 Checks, per episode:
   * meta.json / data.npz carry exactly the agreed keys, with the agreed shapes and dtypes;
   * num_frames == len(t) == the number of PNGs in each camera directory, PNGs are 8-bit
     RGB 256x256 named 000000.png .. and the frame clock is k / fps;
-  * qpos/pts are physically sane: qpos[6] and act[6] inside the hinge range, |dq| per tick
+  * qpos/act are physically sane: qpos[6] and act[6] inside the hinge range, |dq| per tick
     bounded, act - qpos bounded, cube quaternion unit length, spawn z on the table;
+  * the 8-D EE interface holds: pose8_state[k] is the tool0 pose of the recorded qpos[k]
+    (recomputed here by MuJoCo FK, <= 1e-9 per element), pose8_action[k][0:7] is
+    pose8_state[k+1][0:7], both quaternion sequences are unit length and sign-continuous
+    (dot(q_k, q_{k-1}) >= 0, state vs action on the same tick > 0), state g is
+    qpos[6] through GRIPPER_CONFIG, and action g is the commanded g that act[6] was made
+    from;
   * meta and npz agree, rise >= 0.08 m and grasp_ok is true;
-and across episodes: index.json is consistent with the directories it describes.
+and across episodes: index.json is consistent with the directories it describes, plus the
+g -> ctrl -> simulated joint_7 -> g round trip (<= 1e-3) on the arm-only model.
 
-Usage:  python tests_ee/test_act_dataset.py [--dir out/act_demos] [--episodes 20]
+Usage:  python tests_ee/test_act_dataset.py [--dir out/act_demos_ee] [--episodes 20]
 """
 
 from __future__ import annotations
@@ -27,14 +36,30 @@ import sys
 import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+try:
+    import mujoco  # noqa: E402
+except ImportError as exc:  # pragma: no cover - the FK and gripper checks need it
+    raise SystemExit("this test needs mujoco (FK check + gripper round trip): %s" % exc)
+
+from src.pose_cmd.replay import GRIPPER_CONFIG  # noqa: E402
 
 META_KEYS = {"episode", "fps", "num_frames", "camera_hw", "cube_pos", "cube_yaw",
              "rise_m", "slip_m", "grasp_ok", "scene", "control_hz"}
-NPZ_KEYS = {"qpos", "act", "t", "cube_pos", "cube_quat", "rise_m", "slip_m"}
+NPZ_KEYS = {"pose8_state", "pose8_action", "qpos", "act", "ik_err", "t", "cube_pos",
+            "cube_quat", "rise_m", "slip_m"}
 INDEX_KEYS = {"num_episodes", "fps", "control_hz", "task", "camera_names", "state_dim",
               "action_dim", "seed", "mujoco_version", "randomization", "generated_by"}
 CAMERAS = ("front", "wrist")
 HW = (256, 256)
+SCENE = "assets/jaka_zu3/scene_cube_bowl.xml"
+ARM_XML = "assets/jaka_zu3/robot.xml"       # arm + jaws only: the gripper round trip
+EE_SITE = "tool0"
+EE_DIM = 8                                  # x, y, z, qw, qx, qy, qz, g
+QUAT = slice(3, 7)
+POS = slice(0, 3)
 
 MIN_RISE_M = 0.080
 MAX_TICK_STEP_RAD = 0.15     # measured max per-tick joint step 0.045 rad at 20 Hz
@@ -42,6 +67,28 @@ MAX_ACT_QPOS_RAD = 0.35      # measured max |act - qpos| 0.222 rad (the hinge's 
 HINGE_RANGE = (0.0, 0.9)
 HINGE_SLACK = 1e-3
 CUBE_Z = 0.815               # table top 0.80 + half height 0.015, +-1 mm
+FK_TOL_M = 1e-9              # A2: recorded qpos -> FK must reproduce pose8_state
+EE_STEP_M = 0.02             # measured max per-tick EE displacement 0.0101 m
+QNORM_TOL = 1e-9
+G_TOL = 1e-3                 # A4: g -> ctrl -> simulated joint_7 -> g
+G_SLACK = 1e-3               # the hinge settles a hair outside [0, 0.9]
+CTRL_PER_G = float(GRIPPER_CONFIG["ctrl_per_g"])
+OPEN_AT_G = float(GRIPPER_CONFIG["open_at_g"])
+G_JOINT = GRIPPER_CONFIG["joint"]
+
+# ---- the place task (out/act_demos_place): one extra scalar per episode plus a bowl test ----
+PLACE_TASK = "pick up the red block and put it in the bowl"
+PLACE_METRICS = {"bowl_dxy_m", "in_bowl", "hold_err_m"}
+INDEX_PLACE_KEYS = {"task_kind", "table", "bowl_xy_m", "in_bowl_radius_m", "bowl_dxy_max_m",
+                    "in_bowl_all", "hold_err_max_m"}
+BOWL_XY = (0.300, -0.200)
+BOWL_INNER_R_M = 0.045       # the bowl's own inner radius, from the scene geometry
+IN_BOWL_RADIUS_M = 0.030     # accepted: cube centre within this of the bowl centre ...
+IN_BOWL_Z = (0.800, 0.840)   # ... and between the bowl floor and its wall top
+MAX_BOWL_DXY_M = 0.005       # acceptance gate per episode
+MAX_HOLD_ERR_M = 0.002       # cube still between the pads on the last closed-gripper tick
+PLACE_FRAMES = 181           # configs/waypoints_cube_place.json at 20 Hz: 8 waypoints, 181 tick
+RELEASE_G = 0.9              # the place table must end with the gripper commanded open
 
 
 class Checks:
@@ -64,7 +111,62 @@ def read_png_header(path):
     return width, height, depth, colour
 
 
-def check_episode(ck, ep_dir, index):
+_FK = {}
+
+
+def fk_setup():
+    """One model/data pair for the whole run: site poses for an arbitrary qpos."""
+    if not _FK:
+        model = mujoco.MjModel.from_xml_path(os.path.join(REPO, SCENE))
+        _FK["model"] = model
+        _FK["data"] = mujoco.MjData(model)
+        _FK["site"] = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, EE_SITE)
+    return _FK["model"], _FK["data"], _FK["site"]
+
+
+def fk_tool(qpos7):
+    """tool0 (pos (3,), quat (4,) scalar-first) for one recorded qpos, via MuJoCo itself.
+    The cube's free-joint coordinates do not enter the arm chain, so they stay 0."""
+    model, data, site = fk_setup()
+    data.qpos[:] = 0.0
+    data.qpos[:len(qpos7)] = qpos7
+    mujoco.mj_forward(model, data)
+    pos = np.array(data.site_xpos[site], dtype=float)
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, np.asarray(data.site_xmat[site], dtype=float).ravel())
+    return pos, quat
+
+
+def check_gripper_roundtrip(ck):
+    """A4: g -> ctrl (the same GRIPPER_CONFIG the replay uses) -> position servo -> the
+    simulated joint_7 -> g back. Runs on the arm-only model so no cube can block the jaw
+    and no table is in the way; the residual is the servo's sag under gravity."""
+    model = mujoco.MjModel.from_xml_path(os.path.join(REPO, ARM_XML))
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, G_JOINT)
+    adr = int(model.jnt_qposadr[jid])
+    acts = [i for i in range(model.nu)
+            if model.actuator_trnid[i][0] == jid]
+    ck.ok(len(acts) == 1, "%s: expected exactly one actuator, found %d" % (G_JOINT, len(acts)))
+    worst = 0.0
+    rows = []
+    for g in (0.0, 0.25, 0.5, 0.75, 1.0):
+        data = mujoco.MjData(model)
+        data.ctrl[acts[0]] = g / OPEN_AT_G * CTRL_PER_G
+        for _ in range(4000):                      # 8 s at dt=0.002: fully settled
+            mujoco.mj_step(model, data)
+        q7 = float(data.qpos[adr])
+        g_back = q7 * OPEN_AT_G / CTRL_PER_G
+        ck.ok(abs(g_back - g) <= G_TOL,
+              "g -> ctrl -> %s -> g round trip off by %.3e (bound %.1e): g=%.2f q7=%.7f"
+              % (G_JOINT, abs(g_back - g), G_TOL, g, q7))
+        worst = max(worst, abs(g_back - g))
+        rows.append((g, q7, g_back))
+    return worst, rows
+
+
+def check_episode(ck, ep_dir, index, place=False):
+    meta_keys = META_KEYS | PLACE_METRICS if place else META_KEYS
+    npz_keys = NPZ_KEYS | PLACE_METRICS if place else NPZ_KEYS
     ck.ok(os.path.isdir(ep_dir), "%s: missing episode directory" % ep_dir)
     meta_path = os.path.join(ep_dir, "meta.json")
     npz_path = os.path.join(ep_dir, "data.npz")
@@ -73,11 +175,10 @@ def check_episode(ck, ep_dir, index):
     with open(meta_path) as fh:
         meta = json.load(fh)
 
-    ck.ok(set(meta) == META_KEYS,
-          "%s: meta.json keys %s != %s" % (ep_dir, sorted(set(meta)), sorted(META_KEYS)))
+    ck.ok(set(meta) == meta_keys,
+          "%s: meta.json keys %s != %s" % (ep_dir, sorted(set(meta)), sorted(meta_keys)))
     ck.ok(isinstance(meta["episode"], int), "%s: meta.episode is not an int" % ep_dir)
-    ck.ok(meta["scene"] == "assets/jaka_zu3/scene_cube_bowl.xml",
-          "%s: meta.scene %r" % (ep_dir, meta["scene"]))
+    ck.ok(meta["scene"] == SCENE, "%s: meta.scene %r" % (ep_dir, meta["scene"]))
     ck.ok(os.path.isfile(os.path.join(REPO, meta["scene"])),
           "%s: meta.scene does not exist under the repo" % ep_dir)
     ck.ok(meta["camera_hw"] == list(HW), "%s: meta.camera_hw %r" % (ep_dir, meta["camera_hw"]))
@@ -88,19 +189,49 @@ def check_episode(ck, ep_dir, index):
           "%s: control_hz disagrees with index.json" % ep_dir)
     ck.ok(meta["grasp_ok"] is True, "%s: grasp_ok is not true" % ep_dir)
     ck.ok(float(meta["cube_yaw"]) == 0.0, "%s: this round does not randomize yaw" % ep_dir)
-    ck.ok(float(meta["rise_m"]) >= MIN_RISE_M,
-          "%s: rise %.5f m is below %.3f m" % (ep_dir, float(meta["rise_m"]), MIN_RISE_M))
-    ck.ok(0.0 <= float(meta["slip_m"]) < 1e-2, "%s: slip %.6f m" % (ep_dir, float(meta["slip_m"])))
+    if place:
+        # the cube ends in the bowl, not lifted: rise is ~0 by construction, so the lift gate
+        # below would reject every place episode - and would be testing the wrong task.
+        ck.ok(int(meta["num_frames"]) == PLACE_FRAMES,
+              "%s: %d frames, the place table is %d ticks at %r Hz"
+              % (ep_dir, int(meta["num_frames"]), PLACE_FRAMES, meta["fps"]))
+        ck.ok(0.0 <= float(meta["rise_m"]) < 1e-2,
+              "%s: rise %.5f m - a place episode lifts the cube ~2 mm, not out of the bowl's "
+              "reach" % (ep_dir, float(meta["rise_m"])))
+        # slip_m keeps its lift definition (cube drift after the jaws close) and the cube
+        # travels ~0.4 m to the bowl, so it is a distance here, not a grasp-quality bound
+        ck.ok(0.05 <= float(meta["slip_m"]) < 0.6,
+              "%s: slip %.6f m is not the ~0.4 m trip to the bowl" % (ep_dir, float(meta["slip_m"])))
+        ck.ok(float(meta["bowl_dxy_m"]) <= MAX_BOWL_DXY_M,
+              "%s: bowl_dxy %.5f m is above the %.3f m gate"
+              % (ep_dir, float(meta["bowl_dxy_m"]), MAX_BOWL_DXY_M))
+        ck.ok(meta["in_bowl"] is True, "%s: in_bowl is %r, expected a bool true"
+              % (ep_dir, meta["in_bowl"]))
+        ck.ok(float(meta["hold_err_m"]) <= MAX_HOLD_ERR_M,
+              "%s: hold_err %.5f m is above the %.3f m gate - the cube was leaving the pads "
+              "before the release" % (ep_dir, float(meta["hold_err_m"]), MAX_HOLD_ERR_M))
+    else:
+        ck.ok(float(meta["rise_m"]) >= MIN_RISE_M,
+              "%s: rise %.5f m is below %.3f m" % (ep_dir, float(meta["rise_m"]), MIN_RISE_M))
+        ck.ok(0.0 <= float(meta["slip_m"]) < 1e-2,
+              "%s: slip %.6f m" % (ep_dir, float(meta["slip_m"])))
 
     data = np.load(npz_path)
-    ck.ok(set(data.files) == NPZ_KEYS,
-          "%s: data.npz keys %s != %s" % (ep_dir, sorted(set(data.files)), sorted(NPZ_KEYS)))
+    ck.ok(set(data.files) == npz_keys,
+          "%s: data.npz keys %s != %s" % (ep_dir, sorted(set(data.files)), sorted(npz_keys)))
     qpos, act, t = data["qpos"], data["act"], data["t"]
+    state8, action8, ik_err = data["pose8_state"], data["pose8_action"], data["ik_err"]
     n = int(meta["num_frames"])
     ck.ok(qpos.shape == (n, 7), "%s: qpos shape %s != (%d, 7)" % (ep_dir, qpos.shape, n))
     ck.ok(act.shape == (n, 7), "%s: act shape %s != (%d, 7)" % (ep_dir, act.shape, n))
     ck.ok(t.shape == (n,), "%s: t shape %s != (%d,)" % (ep_dir, t.shape, n))
-    for key in ("qpos", "act", "t", "cube_pos", "cube_quat"):
+    ck.ok(state8.shape == (n, EE_DIM),
+          "%s: pose8_state shape %s != (%d, %d)" % (ep_dir, state8.shape, n, EE_DIM))
+    ck.ok(action8.shape == (n, EE_DIM),
+          "%s: pose8_action shape %s != (%d, %d)" % (ep_dir, action8.shape, n, EE_DIM))
+    ck.ok(ik_err.shape == (n,), "%s: ik_err shape %s != (%d,)" % (ep_dir, ik_err.shape, n))
+    for key in ("pose8_state", "pose8_action", "qpos", "act", "ik_err", "t",
+                "cube_pos", "cube_quat"):
         ck.ok(data[key].dtype == np.float64, "%s: %s dtype %s" % (ep_dir, key, data[key].dtype))
     for key in ("rise_m", "slip_m"):
         ck.ok(data[key].shape == () and data[key].dtype == np.float64,
@@ -108,9 +239,34 @@ def check_episode(ck, ep_dir, index):
               % (ep_dir, key, data[key].shape, data[key].dtype))
         ck.ok(abs(float(data[key]) - float(meta[key])) < 1e-12,
               "%s: %s disagrees between data.npz and meta.json" % (ep_dir, key))
-    ck.ok(data["cube_pos"].shape == (3,), "%s: cube_pos shape %s" % (ep_dir, data["cube_pos"].shape))
+    if place:
+        # the three place scalars: right dtype/shape, agreeing with meta.json, and the bowl
+        # test is not just bowl_dxy renamed
+        for key in ("bowl_dxy_m", "hold_err_m"):
+            ck.ok(data[key].shape == () and data[key].dtype == np.float64,
+                  "%s: %s is %s %s, expected a float64 scalar"
+                  % (ep_dir, key, data[key].shape, data[key].dtype))
+            ck.ok(abs(float(data[key]) - float(meta[key])) < 1e-12,
+                  "%s: %s disagrees between data.npz and meta.json" % (ep_dir, key))
+        ck.ok(data["in_bowl"].shape == () and data["in_bowl"].dtype == np.bool_,
+              "%s: in_bowl is %s %s, expected a bool scalar"
+              % (ep_dir, data["in_bowl"].shape, data["in_bowl"].dtype))
+        ck.ok(bool(data["in_bowl"]) is bool(meta["in_bowl"]),
+              "%s: in_bowl disagrees between data.npz and meta.json" % ep_dir)
+        ck.ok(float(data["hold_err_m"]) >= 0.0, "%s: hold_err_m is negative" % ep_dir)
+        ck.ok(IN_BOWL_RADIUS_M < BOWL_INNER_R_M,
+              "the accepted radius %r is not inside the bowl's own %r m inner radius"
+              % (IN_BOWL_RADIUS_M, BOWL_INNER_R_M))
+        # the end-of-episode cube pose is not recorded, so the z half of in_bowl is checked on
+        # the end pose by tests_ee/test_act_rollout.py (bowl_metrics); here the on-disk record
+        # only has to agree with itself
+        ck.ok((float(data["bowl_dxy_m"]) < IN_BOWL_RADIUS_M) == bool(data["in_bowl"]),
+              "%s: in_bowl (%r) disagrees with bowl_dxy %.5f m against the %.3f m radius"
+              % (ep_dir, bool(data["in_bowl"]), float(data["bowl_dxy_m"]), IN_BOWL_RADIUS_M))
     ck.ok(data["cube_quat"].shape == (4,), "%s: cube_quat shape %s"
           % (ep_dir, data["cube_quat"].shape))
+    ck.ok(data["cube_pos"].shape == (3,), "%s: cube_pos shape %s"
+          % (ep_dir, data["cube_pos"].shape))
     ck.ok(np.allclose(data["cube_pos"], np.asarray(meta["cube_pos"], dtype=float), atol=1e-12),
           "%s: cube_pos disagrees between data.npz and meta.json" % ep_dir)
     ck.ok(abs(float(data["cube_pos"][2]) - CUBE_Z) < 1e-3,
@@ -146,9 +302,84 @@ def check_episode(ck, ep_dir, index):
     gap = float(np.abs(act - qpos).max())
     ck.ok(gap <= MAX_ACT_QPOS_RAD,
           "%s: |act - qpos| reaches %.4f rad (bound %.3f)" % (ep_dir, gap, MAX_ACT_QPOS_RAD))
-    ck.ok(qpos[:, 6][0] > qpos[:, 6][-1],
-          "%s: the gripper never closed (hinge %.3f -> %.3f)"
-          % (ep_dir, qpos[0, 6], qpos[-1, 6]))
+    if place:
+        # a place episode starts open, closes on the cube, carries, and lets go at the end
+        ck.ok(qpos[0, 6] > 0.8, "%s: the gripper does not start open (hinge %.3f)"
+              % (ep_dir, qpos[0, 6]))
+        ck.ok(float(qpos[:, 6].min()) < 0.5,
+              "%s: the gripper never closed on the cube (hinge min %.3f; with the 15 mm cube "
+              "between the pads it stops near 0.222, not 0)" % (ep_dir, qpos[:, 6].min()))
+        ck.ok(float(action8[-1, 7]) >= RELEASE_G,
+              "%s: the episode ends with the gripper commanded g=%.4f, i.e. still holding"
+              % (ep_dir, float(action8[-1, 7])))
+        ck.ok(float(action8[:, 7].min()) == 0.0,
+              "%s: no tick commands a fully closed gripper (min g %.4f)"
+              % (ep_dir, float(action8[:, 7].min())))
+        ck.ok(float(action8[-1, 7]) > float(action8[:, 7].min()),
+              "%s: the commanded g never reopens after the grasp" % ep_dir)
+    else:
+        ck.ok(qpos[:, 6][0] > qpos[:, 6][-1],
+              "%s: the gripper never closed (hinge %.3f -> %.3f)"
+              % (ep_dir, qpos[0, 6], qpos[-1, 6]))
+
+    # ---- 8-D EE interface -------------------------------------------------------------
+    ck.ok(np.all(np.isfinite(state8)) and np.all(np.isfinite(action8)),
+          "%s: non-finite values in pose8_state/pose8_action" % ep_dir)
+    for label, block in (("pose8_state", state8), ("pose8_action", action8)):
+        norm_err = float(np.abs(np.linalg.norm(block[:, QUAT], axis=1) - 1.0).max())
+        ck.ok(norm_err <= QNORM_TOL,
+              "%s: %s quaternion norm off by %.3e (bound %.1e)" % (ep_dir, label, norm_err,
+                                                                   QNORM_TOL))
+    # A2: the stored state must be the FK of the stored qpos - not a hand-rolled chain
+    pos_err = 0.0
+    quat_err = 0.0
+    ee_step = 0.0
+    for k in range(n):
+        pos, quat = fk_tool(qpos[k])
+        pos_err = max(pos_err, float(np.abs(pos - state8[k, POS]).max()))
+        want = state8[k, QUAT]
+        quat_err = max(quat_err, float(min(np.abs(quat - want).max(),
+                                           np.abs(quat + want).max())))
+        ee_step = max(ee_step, float(np.abs(action8[k, POS] - state8[k, POS]).max()))
+    ck.ok(pos_err <= FK_TOL_M,
+          "%s: FK(position) of qpos disagrees with pose8_state by %.3e m (bound %.0e)"
+          % (ep_dir, pos_err, FK_TOL_M))
+    ck.ok(quat_err <= FK_TOL_M,
+          "%s: FK(quaternion) of qpos disagrees with pose8_state by %.3e (bound %.0e)"
+          % (ep_dir, quat_err, FK_TOL_M))
+    # A3: sign continuity inside the episode, and state/action agreeing on every tick
+    if n > 1:
+        consec = np.einsum("ij,ij->i", state8[1:, QUAT], state8[:-1, QUAT])
+        ck.ok(float(consec.min()) >= 0.0,
+              "%s: quaternion sign flips between frames (min dot %.6f)"
+              % (ep_dir, float(consec.min())))
+        pose_step = float(np.abs(action8[:-1, :7] - state8[1:, :7]).max())
+        ck.ok(pose_step <= FK_TOL_M,
+              "%s: pose8_action[k] is not the pose of pose8_state[k+1] (off by %.3e)"
+              % (ep_dir, pose_step))
+    same_tick = np.einsum("ij,ij->i", state8[:, QUAT], action8[:, QUAT])
+    ck.ok(float(same_tick.min()) > 0.0,
+          "%s: pose8_state and pose8_action have opposite quaternion signs on a tick "
+          "(min dot %.6f)" % (ep_dir, float(same_tick.min())))
+    # the 8-D rows and the joint rows must describe the same gripper state
+    state_g = qpos[:, 6] * OPEN_AT_G / CTRL_PER_G
+    ck.ok(float(np.abs(state8[:, 7] - state_g).max()) <= 1e-12,
+          "%s: pose8_state[:,7] is not qpos[6] through GRIPPER_CONFIG (off by %.3e)"
+          % (ep_dir, float(np.abs(state8[:, 7] - state_g).max())))
+    ck.ok(float(np.abs(action8[:, 7] - act[:, 6] * OPEN_AT_G / CTRL_PER_G).max()) <= 1e-12,
+          "%s: pose8_action[:,7] is not the g that act[6] was built from (off by %.3e)"
+          % (ep_dir, float(np.abs(action8[:, 7] - act[:, 6] * OPEN_AT_G / CTRL_PER_G).max())))
+    ck.ok(np.all(action8[:, 7] >= -1e-9) and np.all(action8[:, 7] <= 1.0 + 1e-9),
+          "%s: commanded g leaves [0, 1]: %.4f..%.4f"
+          % (ep_dir, action8[:, 7].min(), action8[:, 7].max()))
+    ck.ok(np.all(state8[:, 7] >= -G_SLACK) and np.all(state8[:, 7] <= 1.0 + G_SLACK),
+          "%s: measured g leaves [0, 1]: %.4f..%.4f"
+          % (ep_dir, state8[:, 7].min(), state8[:, 7].max()))
+    ck.ok(ee_step <= EE_STEP_M,
+          "%s: the EE jumps %.4f m within one tick (bound %.3f)"
+          % (ep_dir, ee_step, EE_STEP_M))
+    ck.ok(float(np.abs(ik_err).max()) <= 2.0e-3,
+          "%s: IK residual %.2e m exceeds 2.0e-3" % (ep_dir, float(np.abs(ik_err).max())))
 
     # frames: one PNG per tick per camera, 8-bit RGB, right size, contiguous numbering
     for cam in CAMERAS:
@@ -168,10 +399,15 @@ def check_episode(ck, ep_dir, index):
             ck.ok((depth, colour) == (8, 2), "%s: bit depth %d / colour type %d, expected 8 / 2 (RGB)"
                   % (path, depth, colour))
 
+    return {"pose_err": pos_err, "quat_err": quat_err,
+            "consec_dot": float(np.einsum("ij,ij->i", state8[1:, QUAT],
+                                          state8[:-1, QUAT]).min()) if n > 1 else 1.0,
+            "same_tick_dot": float(same_tick.min())}
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--dir", default=os.path.join(REPO, "out", "act_demos"))
+    ap.add_argument("--dir", default=os.path.join(REPO, "out", "act_demos_ee"))
     ap.add_argument("--episodes", type=int, default=20)
     args = ap.parse_args(argv)
     root = args.dir if os.path.isabs(args.dir) else os.path.join(REPO, args.dir)
@@ -181,16 +417,35 @@ def main(argv=None):
     assert os.path.isfile(index_path), "%s: missing index.json" % root
     with open(index_path) as fh:
         index = json.load(fh)
-    ck.ok(set(index) == INDEX_KEYS,
-          "index.json keys %s != %s" % (sorted(set(index)), sorted(INDEX_KEYS)))
-    ck.ok(index["task"] == "pick up the red block and lift it", "index.task %r" % index["task"])
+    # the directory says which task it holds; --dir alone switches the contract
+    place = index.get("task_kind") == "place"
+    index_keys = INDEX_KEYS | INDEX_PLACE_KEYS if place else INDEX_KEYS
+    ck.ok(set(index) == index_keys,
+          "index.json keys %s != %s" % (sorted(set(index)), sorted(index_keys)))
+    ck.ok(index["task"] == (PLACE_TASK if place else "pick up the red block and lift it"),
+          "index.task %r" % index["task"])
     ck.ok(index["camera_names"] == list(CAMERAS), "index.camera_names %r" % index["camera_names"])
-    ck.ok(index["state_dim"] == 7 and index["action_dim"] == 7,
-          "index.state_dim/action_dim must both be 7")
+    ck.ok(index["state_dim"] == EE_DIM and index["action_dim"] == EE_DIM,
+          "index.state_dim/action_dim must both be %d, got %r/%r"
+          % (EE_DIM, index["state_dim"], index["action_dim"]))
     ck.ok(isinstance(index["seed"], int), "index.seed is not an int")
     ck.ok(float(index["fps"]) == float(index["control_hz"]), "index.fps != index.control_hz")
     ck.ok(isinstance(index["randomization"], str) and "cube xy" in index["randomization"],
           "index.randomization %r" % index["randomization"])
+    if place:
+        ck.ok(index["table"].endswith("waypoints_cube_place.json"),
+              "index.table %r is not the place table" % (index["table"],))
+        ck.ok(list(index["bowl_xy_m"]) == list(BOWL_XY),
+              "index.bowl_xy_m %r != %r" % (index["bowl_xy_m"], list(BOWL_XY)))
+        ck.ok(abs(float(index["in_bowl_radius_m"]) - IN_BOWL_RADIUS_M) < 1e-12,
+              "index.in_bowl_radius_m %r" % (index["in_bowl_radius_m"],))
+        ck.ok(index["in_bowl_all"] is True, "index.in_bowl_all is %r" % (index["in_bowl_all"],))
+        ck.ok(float(index["bowl_dxy_max_m"]) <= MAX_BOWL_DXY_M,
+              "index.bowl_dxy_max_m %r above %r m"
+              % (index["bowl_dxy_max_m"], MAX_BOWL_DXY_M))
+        ck.ok(float(index["hold_err_max_m"]) <= MAX_HOLD_ERR_M,
+              "index.hold_err_max_m %r above %r m"
+              % (index["hold_err_max_m"], MAX_HOLD_ERR_M))
     ck.ok(index["generated_by"] == "experiments/gen_act_dataset.py",
           "index.generated_by %r" % index["generated_by"])
     ck.ok(index["mujoco_version"].startswith("3.16"), "index.mujoco_version %r"
@@ -203,16 +458,49 @@ def main(argv=None):
     ck.ok(int(index["num_episodes"]) == len(eps),
           "index.num_episodes %r != %d directories found" % (index["num_episodes"], len(eps)))
 
+    worst = {"pose_err": 0.0, "quat_err": 0.0, "consec_dot": 1.0, "same_tick_dot": 1.0}
+    bowl_dxy_max = 0.0
+    hold_err_max = 0.0
     for k, name in enumerate(eps):
         ep_dir = os.path.join(root, name)
-        check_episode(ck, ep_dir, index)
+        got = check_episode(ck, ep_dir, index, place)
+        worst["pose_err"] = max(worst["pose_err"], got["pose_err"])
+        worst["quat_err"] = max(worst["quat_err"], got["quat_err"])
+        worst["consec_dot"] = min(worst["consec_dot"], got["consec_dot"])
+        worst["same_tick_dot"] = min(worst["same_tick_dot"], got["same_tick_dot"])
         with open(os.path.join(ep_dir, "meta.json")) as fh:
             meta = json.load(fh)
         ck.ok(meta["episode"] == k, "%s: meta.episode %r != %d" % (ep_dir, meta["episode"], k))
-        print("  %s  %3d frames  rise %.5f m  slip %.6f m  cube xy %+0.3f %+0.3f"
-              % (name, int(meta["num_frames"]), float(meta["rise_m"]), float(meta["slip_m"]),
-                 float(meta["cube_pos"][0]), float(meta["cube_pos"][1])))
+        if place:
+            bowl_dxy_max = max(bowl_dxy_max, float(meta["bowl_dxy_m"]))
+            hold_err_max = max(hold_err_max, float(meta["hold_err_m"]))
+            print("  %s  %3d frames  bowl_dxy %.5f m  in_bowl %s  hold %.5f m  cube xy %+0.3f %+0.3f"
+                  % (name, int(meta["num_frames"]), float(meta["bowl_dxy_m"]),
+                     bool(meta["in_bowl"]), float(meta["hold_err_m"]),
+                     float(meta["cube_pos"][0]), float(meta["cube_pos"][1])))
+        else:
+            print("  %s  %3d frames  rise %.5f m  slip %.6f m  cube xy %+0.3f %+0.3f"
+                  % (name, int(meta["num_frames"]), float(meta["rise_m"]), float(meta["slip_m"]),
+                     float(meta["cube_pos"][0]), float(meta["cube_pos"][1])))
+    if place:
+        # the index must describe what is on disk, not what the generator hoped for
+        ck.ok(abs(bowl_dxy_max - float(index["bowl_dxy_max_m"])) < 1e-6,
+              "index.bowl_dxy_max_m %r != the worst episode %r"
+              % (index["bowl_dxy_max_m"], bowl_dxy_max))
+        ck.ok(abs(hold_err_max - float(index["hold_err_max_m"])) < 1e-6,
+              "index.hold_err_max_m %r != the worst episode %r"
+              % (index["hold_err_max_m"], hold_err_max))
+        print("  place: %d episodes, bowl_dxy <= %.5f m, hold_err <= %.5f m, all %d frames"
+              % (len(eps), bowl_dxy_max, hold_err_max, PLACE_FRAMES))
 
+    g_worst, g_rows = check_gripper_roundtrip(ck)
+    print("  FK(qpos) vs pose8_state: pos %.2e m, quat %.2e (bound %.0e)"
+          % (worst["pose_err"], worst["quat_err"], FK_TOL_M))
+    print("  quaternion min dot: consecutive %.9f, state-vs-action %.9f"
+          % (worst["consec_dot"], worst["same_tick_dot"]))
+    print("  g -> ctrl -> %s -> g: max error %.2e (bound %.0e); %s"
+          % (G_JOINT, g_worst, G_TOL,
+             " ".join("g=%.2f:q7=%.6f" % (g, q7) for g, q7, _ in g_rows)))
     print("%d checks over %d episodes in %s" % (ck.count, len(eps), root))
     print("ALL CHECKS PASSED")
     return 0

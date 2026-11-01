@@ -349,3 +349,557 @@ viewer 的上下文按 20 Hz 回放记录的 `qpos`（14 维：6 轴 + 夹爪 + 
 `outcome` 取值：`diverged / no_motion / gripper_never_closed / slipped_out / not_lifted /
 lift_insufficient / lost_after_lift / success`。
 
+
+---
+
+## 8. 8 维 EE 接口（阶段 A：数据 + 导出 + 开环评测）
+
+§1–§7 是**关节空间**的 7 维接口（state = `qpos`，action = `act`）。这一节是并行的另一套：
+观测/动作都换成**末端位姿**，为将来接真机与手部示教做准备。物理、控制频、substeps、随机化、
+渲染分辨率**一行没改**——同一 `--seed 0` 下新数据的 rise/slip 与旧数据逐位相同
+（rise 0.11833811413533357..0.11895673974152277 m、slip ≤ 0.0005283970146368739 m），
+说明只换了「记录什么」，没换「跑什么」。
+
+### 8.1 契约表
+
+一组 8 维向量，单位米，在机械臂 base 系（本场景 base == world），参考点是 IK 正在打的
+`tool0` site（`assets/jaka_zu3/robot.xml:142`，夹爪指尖中心），位姿由 MuJoCo site 位姿读出，
+**不是**自己拼的 FK 链：
+
+```
+[x, y, z, qw, qx, qy, qz, g]        # pos3 + quat4(标量在前) + g
+```
+
+| 槽位 | 含义 | 单位/范围 |
+|---|---|---|
+| `[0:3]` | tool0 位置 | m |
+| `[3:7]` | tool0 姿态四元数，**标量在前** (`qw` 第一)，单位长度 | 无量纲 |
+| `[7]` | 夹爪开度 `g`：1 = 张开，0 = 闭合 | `[0, 1]`（实测 state 可微微越界 6.5e-6） |
+
+⚠️ **不要再写成 `[pos3, rotvec3, g, 0]`**：那是航点表 `configs/waypoints_cube_lift.json` 的
+8 维 ee8 约定（rotvec + 保留位），与本接口是两套东西，混用会让 quat 的第 2/3 个分量被当成
+欧拉角喂给 IK。本接口不做 rotvec / 6D / 矩阵转换。
+
+| 记录 | 语义 | 与仿真步的关系 |
+|---|---|---|
+| `pose8_state[k]` | 第 k 拍动作**执行前**的 tool0 位姿 + 当时夹爪开度（由 `qpos[k][6]` 反解） | 就是第 k 帧渲染时的状态，与该帧 PNG 严格配对 |
+| `pose8_action[k]` | 第 k 拍动作**执行后**的 tool0 位姿 + **该拍指令的 g** | `[0:7]` 等于 `pose8_state[k+1][0:7]`（逐位相同）；`g` 取指令值而不是执行后的实际开度 |
+
+最后一个 tick（`k = N-1`）的 `pose8_action` 取最后一次 `step()` 之后的采样，所以整条
+episode 的 `pose8_action` 长度与 `pose8_state` 相同，`pose8_action[N-1]` 没有对应的
+`pose8_state[N]`。
+
+`data.npz` 键（旧键保留作调试）：
+
+```
+pose8_state (N,8) float64     ← 策略观测
+pose8_action(N,8) float64     ← 策略动作（回归目标）
+qpos (N,7) act (N,7)          ← 关节空间调试行，语义同 §1
+ik_err (N,)                   ← 每拍 IK 位置残差（m），门限仍是 2.0e-3
+t (N,) cube_pos(3,) cube_quat(4,) rise_m slip_m
+```
+
+`index.json` 的 `state_dim` / `action_dim` 都是 **8**。`meta.json` 键集不变。
+
+### 8.2 四元数符号规范（必须逐帧看，否则相邻帧在网络里是“反向旋转”）
+
+`q` 与 `-q` 是同一个姿态，但作为回归目标时是两个不同的数。规范：
+
+1. episode 首帧取 `qw >= 0`；
+2. 之后逐帧，若 `dot(q_k, q_{k-1}) < 0` 则 `q_k` 整体取负（比较对象是**已经写出去的** `q_{k-1}`）；
+3. `pose8_action[k]` 的四元数**不独立做符号游走**，而是取与 `pose8_state[k]` 同符号——
+   否则同一拍的两个四元数可能差一个负号，模型会学到「动作 ≈ -观测」。
+
+实测（20 条 episode，2160 帧）：相邻帧最小点积 **0.999997873**，state/action 同拍最小点积
+**0.999997873**，两者都 ≥ 0。`tests_ee/test_act_dataset.py` 逐条 episode 断言这两条。
+
+### 8.3 g 换算
+
+唯一配置块与执行器都在 `src/pose_cmd/replay.py`：
+
+```python
+GRIPPER_CONFIG = {"joint": "joint_7", "ctrl_per_g": 0.9, "open_at_g": 1.0}
+g_to_ctrl(g) = g / open_at_g * ctrl_per_g        # g=1 -> ctrl 0.9 (张开), g=0 -> ctrl 0
+g_from_q7(q) = q * open_at_g / ctrl_per_g        # joint_7 位置反解, 即 q / 0.9
+```
+
+`act[6]` 永远等于 `pose8_action[:,7]` 经 `g_to_ctrl` 的值（生成器与测试都断言这条恒等式，
+所以改 `GRIPPER_CONFIG` 时不会两边漂移）。
+
+往返精度（arm-only 模型、位置伺服 `kp=18 kv=0.8`、8 s 收敛，重力下垂是唯一残差）：
+
+| g | joint_7 | 反解 g | 误差 |
+|---|---|---|---|
+| 0.00 | -0.000088 | -0.000098 | 9.8e-5 |
+| 0.25 | 0.224831 | 0.249812 | 1.9e-4 |
+| 0.50 | 0.449805 | 0.499783 | 2.2e-4 |
+| 0.75 | 0.674789 | 0.749765 | 2.3e-4 |
+| 1.00 | 0.899784 | 0.999760 | 2.4e-4 |
+
+最大 **2.40e-4** ≪ 1e-3 判据（`tests_ee/test_act_dataset.py` 里断言）。
+注意 `state8[:,7]` 是**实际**开度：夹住方块时指令 g=0 而 `joint_7` 只合到 0.222，
+`state` 因此读到 0.247（物理正确）；`action8[:,7]` 才是指令的 0。
+
+### 8.4 重训命令（四个环境变量照 §0）
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+export PY=/home/zh/miniconda3/envs/lerobot/bin/python
+export HF_HOME=$PWD/data/_scratch/hf_home HF_DATASETS_CACHE=$HF_HOME/datasets
+
+# 1) 生成 8 维示教（mujoco env！lerobot env 的 mujoco 不要用来生成）
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/gen_act_dataset.py --seed 0
+#    -> out/act_demos_ee/ 20 条 x 108 tick
+
+# 2) 导出
+$PY scripts/export_lerobot_dataset.py --demos out/act_demos_ee --out data/lerobot/act_pick_cube_ee
+#    -> num_episodes=20 num_frames=2160
+
+# 3) 训练（CPU 200 步冒烟；正式版把 device/steps/batch/out 换成 §2.3 那组）
+$PY -m lerobot.scripts.lerobot_train \
+  --dataset.repo_id=local/act_pick_cube_ee --dataset.root=data/lerobot/act_pick_cube_ee \
+  --policy.type=act --policy.repo_id=local/act_pick_cube_ee_200 --policy.push_to_hub=false \
+  --policy.device=cpu --policy.chunk_size=32 --policy.n_action_steps=8 \
+  --output_dir=out/act_train_ee_200 --job_name=act_pick_cube_ee_200 \
+  --batch_size=8 --num_workers=0 --steps=200 --log_freq=50 --save_freq=200 --wandb.enable=false
+
+# 4) 开环评测（出口码 1 = FAIL 属正常，见下）
+$PY scripts/eval_act_openloop.py --ckpt out/act_train_ee_200 --demos out/act_demos_ee \
+  --holdout-ep last --device cpu
+
+# 5) 契约测试（lerobot env，会真跑 MuJoCo FK 与 gripper 往返）
+$PY tests_ee/test_act_dataset.py
+```
+
+实测（200 步 / batch 8 / chunk 32 / n_action 8 / cpu，约 4 分 52 秒）：
+
+```
+step:200 smpl:2K ep:15 epch:0.74 loss:3.378 grdn:96.501 lr:1.0e-05 updt_s:0.972 data_s:0.448
+INFO ot_train.py:514 End of training
+```
+
+```
+     dim |  model MSE  model MAE |   mean MSE |  persis MSE
+       z |   0.002258   0.033495 |   0.002642 |    0.000013
+      qw |   0.000007   0.001762 |   0.000011 |    0.000000
+       g |   0.065408   0.147103 |   0.199308 |    0.000467
+ overall |   0.008460   0.023105 |   0.025268 |    0.000060
+[eval] 判定: FAIL  ...  exit 1
+```
+
+200 步必然 FAIL：模型总体 MSE 0.008460 已经赢过 mean 基线（3.0x），但输给 persistence
+（0.000060）——20 Hz 的平滑航点示教里相邻动作几乎相同，persistence 在**轨迹内插值**这件事上
+几乎不可战胜。这不是本接口的问题，判据本身不该为此放宽（§6 的 7 维数据也是同一结论：
+0.020980 vs 0.000108）。
+
+> 8 维比 7 维多了一个「结构事实」：overall MSE 是 8 个量纲不同的维度的等权平均（米 / 无量纲），
+> 只能做**相对**比较；诊断要看逐维表。另外 `g` 一维就占了模型 MSE 的 97%（0.065408/8 ≈ 0.0082
+> 的总体贡献），因为它在 close 那一段要跳变而模型只学会了均值附近。
+
+### 8.5 兼容性：**旧 7 维 checkpoint 与新数据不能混用**
+
+两个方向都不行。脚本层面都会**响亮地**失败（下面每条都是实测原文），所以真正的风险只有
+「有人为了让它跑起来手工补维度」那一种：
+
+- **新 checkpoint / 新脚本喂旧 7 维数据**：旧 `data.npz` 没有 `pose8_state`/`pose8_action`，
+  两个脚本在读第一帧之前就退出：
+
+  ```
+  [export] 错误: 本导出器只支持 8 维 state/action，index.json 声明为 state_dim=7 action_dim=7
+  [eval] 错误: ep000/data.npz 缺少 'pose8_state'（旧 7 维示教没有 EE 数组，请用 ... 重新生成）
+  ```
+- **旧 checkpoint 喂新数据**：LeRobot 的 `policy_preprocessor.json` 里存着归一化统计量
+  （均值/方差形状 `(7,)`）、`config.json` 里 `input_features.observation.state.shape=[7]`。
+  实测（拿 `out/act_train/checkpoints/last/pretrained_model` 去评 `out/act_demos_ee`）：
+
+  ```
+  RuntimeError: The size of tensor a (8) must match the size of tensor b (7) at non-singleton dimension 1
+  ```
+
+  真正的坑在于「为了让它跑起来手工补维度」：把 7 维 checkpoint 的归一化统计量补齐成 8 维，
+  模型就会拿 `qw` 的统计量去解释第 4 个关节角，输出**静默错**。所以：
+
+> 7 维 checkpoint（`out/act_train/checkpoints/{002500,005000,last}`）只配 7 维数据
+> （`out/act_demos` + `data/lerobot/act_pick_cube`）；8 维必须从 §8.4 的第 2 步重新导出、
+> 第 3 步重新训练。旧产物一律保留未动（sha256 校验：`out/act_demos/index.json` =
+> `3117132a…`、`data/lerobot/act_pick_cube/meta/info.json` = `bb63168c…`）。
+
+闭环 `experiments/act_rollout.py` 本阶段**没有**改，仍然是 7 维：它读的是旧 checkpoint 与
+`qpos`，跑得通，但不认识 `pose8_*`。8 维闭环是阶段 B 的事。
+
+### 8.6 一条旧结论已过期
+
+§4 说「lerobot 侧的 mujoco 3.1.6 加载不进本仓库场景（`invalid qpos size, expected length 14`）」
+——现在不成立：`assets/jaka_zu3/scene_cube_bowl.xml:78-83` 的 `<key>` 已经把 qpos 补到 14 维，
+3.1.6 能正常加载（nq=14 / nsite=1），本轮 `tests_ee/test_act_dataset.py` 就是在 lerobot env
+（mujoco 3.1.6）里做的真 FK 与真 gripper 往返。§4 的闭环决策是否要重开，留给阶段 B 评估。
+
+---
+
+## 9. 阶段 B：闭环 8 维接口
+
+§8.5 说「闭环 `experiments/act_rollout.py` 本阶段**没有**改，仍然是 7 维」。这一节就是那笔账：
+现役 `experiments/act_rollout.py` 已改成 **策略输出 8 维 EE → IK → 关节 ctrl**（384 → 706 行），
+旧的 7 维实现原样搬到 `legacy/act_rollout_joint7.py`（384 → 389 行，多出的 5 行是 RETIRED 横幅）。
+
+### 9.1 解码链（一行一行的契约）
+
+```
+a8 = [x, y, z, qw, qx, qy, qz, g]        # 与 pose8_* 同一布局，base(=world) 系，米，1=张开
+  -> |q| 归一化                          # |q| < 0.5 视为坏动作：计数、复用上一拍 ctrl，不抛异常
+  -> R = mju_quat2Mat(q)
+  -> q6 = ik.solve(pos, R, q_seed=data.qpos[:6])；不收敛再 ik.solve_robust(...)（16 个确定性种子）
+  -> 仍不收敛 / 不在关节限位内 -> 计数 + 复用上一拍 ctrl
+  -> ctrl[:6] = q6 + feedforward(q6)     # use_ff=True，src/pose_cmd/replay.py:203-205
+     ctrl[6]  = g_to_ctrl(clip(g, 0, 1)) # GRIPPER_CONFIG: ctrl_per_g=0.9, open_at_g=1.0
+```
+
+观测侧 `observation.state`（8 维）= `fk_tool(tool0)` 的 pos3 + quat4 + 实测开度 `qpos[6]/0.9`，
+其中位姿走的是 `gen_act_dataset.fk_tool`（私有 MjData + `mj_kinematics`，不碰 plant），
+**不是** `data.site_xpos`——和造数据时同一个函数，B4 才能逐位相等。
+四元数符号与训练一致：首拍先翻到 `qw >= 0`，之后逐拍 `dot(q_k, q_{k-1}) < 0` 就整帧取负
+（`gen_act_dataset.sign_walk` 的逐拍版；q 与 -q 是同一个姿态，但网络吃的是数字）。
+
+两处「必须」，都是实测出来的：
+
+- **`mju_quat2Mat` 不归一化**。把动作四元数乘 3 直接喂进去，矩阵元素偏 **8.000**；先归一化再算，
+  3q 与 q 的差是 **4.441e-16**（B3 的判据是 ≤1e-12）。
+- **g 是回归量**，冒烟模型实测首帧写 1.1003。不 clip 就会算出 `ctrl[6] = 0.99`，越过 `joint_7`
+  的 `[0, 0.9]`（`assets/jaka_zu3/gripper_real.xml:68`）。clip 之后 ctrl[6] 严格落在 [0, 0.9]。
+
+### 9.2 `--replay-demos`：没有 8 维 checkpoint 时唯一能做的真实验证
+
+不吃策略、不吃 checkpoint：把 `data.npz` 的 `pose8_action` 当作"策略输出"逐拍喂进上面那条解码链，
+闭环跑完整个 episode，用同一套 `classify()` 判据判成功。episode 的 cube offset 从 `meta.json` 的
+`cube_pos` 反推（`dx = cube_pos[0] - CUBE_XY[0]`），所以 `--start approach` 落点就是该 episode
+录制时的第一帧。
+
+**在哪个 env**：mujoco env（`/home/zh/miniconda3/envs/mujoco/bin/python`，mujoco 3.16 —— 造数据用的
+就是它，物理版本必须一致；这个 env **没有 torch**，所以 `import torch` 被推迟进 `load_policy()`，
+模块顶层没有它）。
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/act_rollout.py --replay-demos out/act_demos_ee
+```
+
+20 条全跑，实测（`out/act_rollout/summary.json`）：
+
+| 判据 | 阈值 | 实测 | 结论 |
+|---|---|---|---|
+| `rise_m`（20 条） | ≥ 0.08 | **min 0.117544 / max 0.118662** | PASS（20/20 success） |
+| `slip_m` | ≤ 0.005 | **max 0.000993** | PASS |
+| `tool_offset_m` | ≤ 0.040 | **max 0.001699** | PASS |
+| IK 位置残差 | ≤ 2.0e-3 m | **max 9.959e-04** | PASS |
+| IK 角度残差 | — | max 0.499 deg | 记录 |
+| IK 失败 / 回退 / 越限 | 0 | **0 / 0 / 0**（restarts 0） | 全部一次收敛 |
+| 坏动作 / g clip | — | 0 / 0（示教动作本身合法） | 记录 |
+| 首拍 state 偏差 | ≤ 1e-9 | **0.0（20 条全是 0）** | PASS |
+| 中途 state 最大偏差 | — | 0.019647 m | 预期内，见下 |
+
+整轮 11.6 s，IK 0.4 ms/拍。
+
+**为什么重放不是逐位复现**：同一个位姿有多个关节解，IK 从当前 qpos 温启动会解到另一组关节角，
+于是末端虽然到了同一个位姿，中间过程与录制差了最多 1.96 cm。判据因此是那几条验收数字，不是
+与录制 qpos 的逐位相等——但**第一拍**是逐位相等的（同一 reset、同一 fk_tool）。
+
+**不许作弊**：这条链里没有任何一条「把录制的 qpos 直接写进 ctrl」的旁路，动作只能从
+`pose8_action` 经「归一化 → 旋转矩阵 → IK → 前馈」变成 ctrl。
+
+### 9.3 两个环境的分工（`import torch` 只在 `load_policy()` 里）
+
+| 要跑什么 | 用哪个 env | 为什么 |
+|---|---|---|
+| `--replay-demos`（离线验证解码链） | mujoco env | 物理 3.16 与造数据一致；不需要 torch |
+| 策略闭环（`--ckpt ...`） | lerobot env | 需要 lerobot + torch |
+
+三种出错姿势都实测过，都是**一句话退出**，不是 traceback：
+
+```
+$ /home/zh/miniconda3/envs/mujoco/bin/python experiments/act_rollout.py --trials 1
+[roll] this interpreter has no torch, so it cannot run the policy.
+       the policy path needs the lerobot env; --replay-demos <dir> exercises the
+       same decode chain in the mujoco env (mujoco 3.16, the demos' version).
+
+$ $PY experiments/act_rollout.py --ckpt out/act_train/checkpoints/last/pretrained_model --trials 1
+[roll] .../out/act_train/checkpoints/last/pretrained_model has a 7-dim action head; this rollout
+       drives the 8-D EE interface and needs 8 (x,y,z,qw,qx,qy,qz,g).
+       train/export the 8-D checkpoint into out/act_train_ee, or run the 7-D one with
+       legacy/act_rollout_joint7.py
+```
+
+`av` 只装在 lerobot env，所以 replay 在 mujoco env 里**不写 mp4**（打印一行提示），PNG 关键帧照写
+（`src/pose_cmd/replay.py:120` 的 PNG 写入只用 zlib）。要看视频就在 lerobot env 里跑，或者只收 PNG。
+
+策略路径的冒烟（用已有的 8 维冒烟 checkpoint，40 拍，只为证明管线通、不证明成功率）：
+
+```
+$ $PY experiments/act_rollout.py --ckpt out/act_train_ee/checkpoints/last/pretrained_model \
+    --trials 1 --max-steps 40 --json-only --no-video
+[roll] ckpt=... chunk=100 n_action=100
+[trial 00] ... steps 40 ... ik 9.43e-04 m 0.49 deg  fb 0 fail 0 clip 27 ... gripper_never_closed
+```
+
+`clip 27`：40 拍里有 27 拍的 `g` 越界被 clip——就是 §8.4 那个「冒烟模型写 1.1003」的实测复现。
+没有这层 clip，`ctrl[6]` 会去 0.99。
+
+### 9.4 CLI 与产物
+
+| 参数 | 阶段 A 之前 | 现在 |
+|---|---|---|
+| `--ckpt` | `out/act_train/...`（7 维） | 默认 `out/act_train_ee/checkpoints/last/pretrained_model`（8 维）；旧路径不是硬依赖，找不到就一句话退出 |
+| `--trials` | 10 | 默认 `None`：策略路径 10，`--replay-demos` 是「目录里找到几条跑几条」（20） |
+| `--replay-demos DIR` | — | 新增，离线验证模式，不吃策略 |
+| `--device/--out/--seed/--max-steps/--start/--json-only/--no-video/--viewer/--viewer-passes` | | 语义未变 |
+
+控制频率（20 Hz）、substeps（25）、`MAX_STEPS`、`GRASP_G`、`CRITERIA` 全部未动。
+`summary.json` 在原有字段上多了 `mode / replay_demos / ee_layout / ee_site / rise_min_m / rise_max_m /
+slip_max_m / tool_offset_max_m / ik_pos_err_max_m / ik_ang_err_max_deg / ik_{fallback,fail,limit,restart}
+ticks / bad_action_ticks / g_clip_ticks / state_dev0_max / state_dev_max / ik_ms_mean`，
+每 trial 多了 `ik_pos_max_m / ik_ang_max_deg / ik_fallback / ik_fail / ik_limit / g_clip /
+bad_actions / state_dev0 / state_dev_max / state8_0 / mode`。
+
+### 9.5 测试
+
+`tests_ee/test_act_rollout.py`（200 → 458 行，245 checks）在原有「随机化 / runaway / 判据分支」
+之上加了 8 维那半边：解码（3q 归一化 → 同一 R；坏动作被标记而不是被放大成旋转；g 两侧 clip）、
+ctrl 行（前馈 + clip 后的 `ctrl[6]` 落在 `joint_7` 的 `[0, 0.9]`）、观测（首拍翻号、dot<0 逐拍取负、
+开度 = `hinge_q(qpos[6])`）、replay 管路（episode 按名排序、offset 从 `meta.json` 反推）、
+以及两条源码契约（模块顶层无 `import torch`、legacy 副本带 RETIRED 横幅）。
+
+负向变异都实测会红（变异文件在 /tmp，仓库内不动）：
+
+| 变异 | 结果 |
+|---|---|
+| `decode_pose8` 去掉 `np.clip(g_raw, 0, 1)` | `EXIT=1`，`AssertionError: decode: g=1.1 was not clipped to 1.0` |
+| `decode_pose8` 去掉 `quat / norm` | `EXIT=1`，`AssertionError: ... changed the rotation by 8.000000000000002` |
+
+### 9.6 旧 7 维通路没被弄坏
+
+`legacy/act_rollout_joint7.py` = HEAD 的 `experiments/act_rollout.py` 逐字节 + 5 行横幅。
+lerobot env 实跑：
+
+```
+$ $PY legacy/act_rollout_joint7.py --ckpt out/act_train/checkpoints/last/pretrained_model \
+    --trials 1 --max-steps 40 --json-only --no-video --out out/act_rollout_joint7
+[trial 00] ... steps 40 ... grasp None ... gripper_never_closed      EXIT=0
+```
+
+40 拍只够走到接近段（这一拍的 grasp 还没发生），所以判定是 `gripper_never_closed`；
+跑满 200 拍同一条 trial 是 `success`（rise +0.1250，slip 0.0083，tool 0.0028，EXIT=0），
+这就是用户那份 10/10 的来源，通路未变。
+
+> 注意：这两条命令都额外传了 `--out out/act_rollout_joint7`。不传的话它按 7 维时代的默认写
+> `out/act_rollout/summary.json`，会**覆盖**阶段 B 的 8 维产物。
+
+### 9.7 未验证 / 已知边界
+
+- **闭环成功率已验（2026-11-01）**：`out/act_train_ee` 的 2000 步 checkpoint 跑到 **50/50 成功**
+  （5 seed × 10 次，slip 最大 5.25 mm，含 8 维 vs 7 维的逐次配对对比）——见 `docs/VERIFICATION.md` §G。
+  §9.2 验的仍然只是解码链，不是策略。
+- **`success` 里没有 slip**：`classify()` 只查 `rise_m` 与 `tool_offset_m`（`experiments/act_rollout.py:140`），
+  抓取质量必须另看 summary 的 `slip_max_m`，否则成功率是虚的（见 §G1）。
+- **`joint_7` 是软限位**：`ctrl[6]` 严格在 `[0, 0.9]` 内（实测 0.900000000000000），但 MuJoCo 的
+  关节限位是软约束，实测关节会停在 `0.9` 上方 1.04e-06（录制数据自己也是 8.24e-06）。判定用
+  仓库既有的 `JNT_TOL_RAD = 1e-3`（`tests_ee/test_act_rollout.py` 里对 7.48e-06 也有断言）。
+- **旧 10/10 已整体复跑（10 次，2026-11-01）**：`10/10` 成立，但按 5 mm slip 线只有 **4/10**；
+  逐次数字在 `docs/VERIFICATION.md` §G1。
+- **mp4 在 mujoco env 里没有**（无 `av`），replay 只落 PNG；`--viewer` 的窗口在本轮没有被打开
+  （用户桌面上不许弹窗），只有 `--help` 与参数解析被验证。
+
+---
+
+## 10. 阶段 C：放置任务（夹起 → 放进碗里）
+
+第二条数据/评测链，和 §8–§9 的 lift 任务**并行**：同一套 8 维 EE 接口、同一个场景、同一套
+20 Hz / 25 substeps / 随机化，只是示教表换了一张、判据换了一套。
+
+### 10.1 表从哪来：`configs/waypoints_cube_place.json`
+
+8 个航点，全部 `rotvec=[0,π,0]`，`meta.control_hz=50`（和 lift 表一样是 50 Hz 写表，生成器按
+`CONTROL_HZ=20` 重采样），@20 Hz 共 **181 拍**：
+
+| # | label | xyz (m) | duration_s | g |
+|---|---|---|---|---|
+| 0 | approach | 0.474, 0.0435, 0.910 | 1.2 | 1 |
+| 1 | descend | 0.474, 0.0435, 0.815 | 1.0 | 1 |
+| 2 | close | 0.474, 0.0435, 0.815 | 0.6 | 0 |
+| 3 | lift | 0.474, 0.0435, 0.935 | 1.0 | 0 |
+| 4 | carry | 0.300, −0.200, 0.945 | 1.4 | 0 |
+| 5 | lower | 0.300, −0.200, 0.870 | 0.8 | 0 |
+| 6 | release | 0.300, −0.200, 0.870 | 0.6 | 1 |
+| 7 | retreat | 0.300, −0.200, 0.935 | 0.9 | 1 |
+
+碗的几何（`assets/jaka_zu3/scene_cube_bowl.xml`）：中心 `(0.300, −0.200)`、内半径 0.045、
+壁顶 `z=0.840`、底 `z=0.802`；方块静止时中心 `z=0.817`（那 0.870 的释放高度让方块从 ~5 cm
+自由落体进碗，不是贴上去放的）。
+
+### 10.2 与 lift 的三处差别（都是必须的，不是风格问题）
+
+1. **判据**：place 不看 `rise_m`。放置任务本来就不抬升——脚本化数据实测 `rise ≈ +0.0020 m`，
+   `CRITERIA["min_rise_m"]=0.08` 永远不可能满足。place 的成功是「末帧方块在碗里 **且** 末拍
+   指令 `g ≥ 0.9`（已松手）」。
+2. **随机化锚点**：见 10.3。lift 表整表跟着方块偏移；place 表只让 `approach/descend/close/lift`
+   跟着走。
+3. **三个新指标**：`bowl_dxy_m` / `in_bowl` / `hold_err_m`，写进 `data.npz`、`meta.json`、
+   `index.json`、`summary.json`（缺一不可：导出与读回都靠它们自证）。
+
+> **`slip_m` 在这里换了含义，别拿 5 mm 线卡它**：`slip_m` 的定义是「夹爪闭合之后方块的水平位移」，
+> 而 place 把方块搬了 ~0.4 m，所以实测 `slip_m ≈ 0.28–0.32 m`。旧定义一行没改（lift 的
+> `slip ≤ 5.3e-4 m` 逐位不变），但 place 的 `slip_m` 是**搬运距离**，不是抓取质量指标。
+> 抓取质量在 place 里由 `hold_err_m` 承担（松手前最后一拍方块离 tool0 多远）。
+
+> **「已松手」怎么判：物理脱离，不看指令值**（2026-11-01 修正）。原判据要求末拍指令
+> `g ≥ 0.9`，但真实策略的 g 头系统性偏低：step 6000 权重在 80 次物理成功的试次里末拍
+> `g` 只有 **0.62–0.80**，于是 20/20、80/80 全被判成 `never_released`。现在的证据是
+> `tool_offset_m`（末帧方块中心到 tool0 的距离）：夹住时 0.013–0.025 m，松手退开后
+> 0.11–0.32 m，阈值 `RELEASE_SEP_M = 0.05 m`。`cmd_g_last` 仍写进 summary 当测量值。
+
+### 10.3 为什么要「锚定」（`ANCHORED_LABELS`）
+
+方块 xy 每个 episode 随机偏移 `dx ∈ ±0.020 m`、`dy ∈ ±0.005 m`；**碗在世界坐标里是固定的**
+（它是场景资产，不在随机化范围内）。如果整张表跟着偏移走，`carry/lower/release/retreat` 会
+整体漂 ±20 mm，于是方块落在碗沿上或掉在碗外——offset 越大越离谱，而成功率统计会把这种
+「表设计错误」伪装成「策略泛化不好」。
+
+所以 `experiments/gen_act_dataset.py` 里有一条常量：
+
+```python
+ANCHORED_LABELS = ("carry", "lower", "release", "retreat")
+```
+
+`shifted_table(base, dx, dy)` 只给**不在**这个元组里的航点加 `(dx, dy)`。lift 表里一个都没有，
+所以 lift 数据的每一个字节都没变（§10.8 的回归里有逐位对比）。
+
+### 10.4 生成（mujoco env，20 条约 30 s）
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/gen_act_dataset.py \
+  --table configs/waypoints_cube_place.json \
+  --out out/act_demos_place
+```
+
+- `--table` 不给时仍然是 `configs/waypoints_cube_lift.json`，`--out` 不给时仍然是
+  `out/act_demos_ee`——**默认行为逐位未变**；`--out` 不给但 `--table` 是 place 表时，产物落
+  `out/act_demos_place`。
+- 任务是**从表的 label 推出来的**（`table_task(base)`：有 `ANCHORED_LABELS` 里的 label 就是
+  place），不额外加 `--task` 开关，免得命令行和表打架。
+- 收条门槛（place）：`in_bowl` 为真、`bowl_dxy_m ≤ 5 mm`、`hold_err_m ≤ 2 mm`、`ik_err ≤ 2e-3 m`；
+  lift 的 `rise ≥ 0.08 m` 那条门槛对 place 不适用，换成了上面这组。
+- 产物：`ep000..ep019/{data.npz,meta.json,front/,wrist/}`、`index.json`、`summary.json`。
+  `data.npz` 在原来 10 个键之上多 `bowl_dxy_m`(float64 标量)、`in_bowl`(bool 标量)、
+  `hold_err_m`(float64 标量)。
+
+实测（本轮）：`20/20 episodes in 29.7 s, 20 attempts`，`in_bowl 20/20`，
+`bowl_dxy 0.00207..0.00466 m`，`hold_err ≤ 0.00119 m`，`ik residual ≤ 9.97e-04 m`，
+每条都是 181 拍。
+
+### 10.5 导出（lerobot env）
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+export HF_HOME=$PWD/data/_scratch/hf_home
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+/home/zh/miniconda3/envs/lerobot/bin/python scripts/export_lerobot_dataset.py \
+  --demos out/act_demos_place \
+  --out data/lerobot/act_pick_place \
+  --repo-id act_pick_place
+```
+
+导出的 task 字符串取 `index.json` 的 `task`，place 数据是
+`pick up the red block and put it in the bowl`（`meta/tasks.parquet` 里就这一条）。
+读回实测：`num_episodes=20 num_frames=3620`（181×20）、`action (8,)`、`observation.state (8,)`、
+两路相机 `observation.images.front/wrist`。
+
+### 10.6 训练（用户自己的 GPU 会话，本轮**没有**跑）
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+export HF_HOME=$PWD/data/_scratch/hf_home
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+/home/zh/miniconda3/envs/lerobot/bin/python -m lerobot.scripts.lerobot_train \
+  --dataset.repo_id=local/act_pick_place \
+  --dataset.root=data/lerobot/act_pick_place \
+  --policy.type=act \
+  --policy.repo_id=local/act_pick_place \
+  --policy.push_to_hub=false \
+  --policy.device=cuda \
+  --output_dir=out/act_train_place \
+  --job_name=act_pick_place \
+  --batch_size=8 \
+  --num_workers=8 \
+  --steps=2000 \
+  --log_freq=50 \
+  --save_freq=500 \
+  --seed=1000 \
+  --wandb.enable=false
+```
+
+参数与 §2.3 完全一致（`--policy.repo_id`、`--policy.push_to_hub=false` 两个坑照踩），只换了
+数据集、输出目录与 job 名：**`out/act_train_place` 是 `act_rollout.py --task place` 的默认
+checkpoint 路径**，训完不用再传 `--ckpt`。181 拍 < ACT 默认 `chunk_size=100`… 反过来：episode
+比 chunk 长，不存在 pad 问题。
+
+### 10.7 回放 / 看过程
+
+**A. 没有 checkpoint 时（脚本示教回放，验证数据本身）**
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/act_rollout.py \
+  --replay-demos out/act_demos_place --task place --json-only --no-video \
+  --out scratch/rollout_place_replay
+```
+
+实测：`20/20 success`，`bowl_dxy 0.004606..0.004751 m`、`hold_err ≤ 0.00122 m`、
+`ik ≤ 9.99e-04 m`，1.9 s 跑完。
+
+**B. 训练好之后，开 MuJoCo 窗口看过程**
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+export HF_HOME=$PWD/data/_scratch/hf_home
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export DISPLAY=:1
+/home/zh/miniconda3/envs/lerobot/bin/python experiments/act_rollout.py \
+  --task place --trials 1 --viewer
+```
+
+`--task place` 会把默认 checkpoint 指到 `out/act_train_place/checkpoints/last/pretrained_model`、
+默认产物目录指到 `out/act_rollout_place/`，并按 place 判据打标签；`--viewer` 是 §7 那个两段式
+（先无头跑完，再另起窗口 20 Hz 回放 14 维 `qpos`）。**注意两条命令用的 python 不同**：回放
+`--replay-demos` 不需要 torch，用 mujoco env；吃 checkpoint 的那条必须用 lerobot env。
+
+`--task place` 的 `outcome` 值：`diverged / no_motion / gripper_never_closed /
+never_released / not_in_bowl / success`。`summary.json` 里除原有字段外多了
+`task_kind / table / anchored_labels / bowl_xy_m / bowl_dxy_min_m / bowl_dxy_max_m /
+in_bowl_count / in_bowl_all / hold_err_max_m`，`criteria` 换成 place 的那一套
+（`release_sep_m / in_bowl_radius_m / in_bowl_z / max_ik_err_m / grasp_g_below / ctrl_limit`，
+**没有** `min_rise_m`），每 trial 多 `bowl_dxy_m / in_bowl / released / hold_err_m / cmd_g_last`。
+不带 `--task` 时（`lift`）产物与字段和 §9.4 逐位一致。
+
+### 10.8 测试与本轮负向变异
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+/home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_dataset.py                                  # lift, 14317 checks
+/home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_dataset.py --dir out/act_demos_place         # place, 23425 checks
+/home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_rollout.py \
+  --place-summary scratch/rollout_place_replay/summary.json                                              # 546 checks
+```
+
+`test_act_dataset.py` **不 import 生成器**（它只验盘上的产物），所以它按 `index.json` 里的
+`task_kind` 切契约：place 目录多要求 3 个键、`num_frames == 181`、`in_bowl` 为真、`bowl_dxy ≤ 5 mm`、
+`hold_err ≤ 2 mm`、末拍 `g ≥ 0.9`、`g` 曾到 0。lift 目录的要求一条没少。
+
+负向变异（实测，变异完已按 md5 还原）：
+
+| 变异 | 结果 |
+|---|---|
+| `ANCHORED_LABELS = ()` | `EXIT=1`，`AssertionError: shifted_table: 'carry' moved by (+0.0170, +0.0040), expected (+0.0000, +0.0000) - the bowl does not follow the cube offset` |
+| place 判据认 `rise`（造 rise=0.12 但 `in_bowl=False`） | 断言要求 `not_in_bowl`，同时要求同一份 rec 在 lift 判据下是 `success`——两条互相咬死，`rise` 一旦混进 place 判据必红 |
+
+`--viewer` 在本轮**没有真的开过窗口**（用户桌面上不许弹窗）：`check_viewer_stub()` 把
+`play_in_viewer` 换成记录参数的 stub，验证「不带 `--viewer` 时不被调用」+「带时收到
+`(scene, traces, control_hz, passes)`、1 条 trace、形状 `(181, 14)`、`passes==3`」。

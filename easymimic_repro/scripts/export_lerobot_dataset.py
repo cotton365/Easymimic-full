@@ -1,14 +1,16 @@
 #!/usr/bin/env python
-"""把仿真示教目录 (out/act_demos) 导出为 LeRobot v3 数据集 (parquet + 逐帧 PNG)。
+"""把仿真示教目录 (out/act_demos_ee) 导出为 LeRobot v3 数据集 (parquet + 逐帧 PNG)。
 
-输入契约:
-  <demos>/index.json                 {fps, task, camera_names, state_dim, action_dim}
-  <demos>/<ep>/data.npz             qpos(N,7) act(N,7) t(N,) cube_pos(3,) cube_quat(4,) rise_m, slip_m
+输入契约 (8 维 EE 接口, 见 docs/ACT_PIPELINE.md §8):
+  <demos>/index.json                 {fps, task, camera_names, state_dim=8, action_dim=8}
+  <demos>/<ep>/data.npz             pose8_state(N,8) pose8_action(N,8) ...
+                                    [x,y,z,qw,qx,qy,qz,g]: state 是该拍动作执行前的
+                                    tool0 位姿+夹爪开度, action 是执行后位姿+该拍指令 g
   <demos>/<ep>/<cam>/<000000.png>   256x256 RGB uint8
 
 输出契约 (LeRobot v3, use_videos=False 因为本环境无 torchcodec):
-  observation.state  float32[7]
-  action             float32[7]
+  observation.state  float32[8]
+  action             float32[8]
   observation.images.front  image (256,256,3)
   observation.images.wrist  image (256,256,3)
 """
@@ -26,10 +28,10 @@ from PIL import Image
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-REPO_ID = "local/act_pick_cube"
+REPO_ID = "local/act_pick_cube_ee"
 IMAGE_SIZE = 256
-STATE_DIM = 7
-ACTION_DIM = 7
+STATE_DIM = 8
+ACTION_DIM = 8
 # 只导出契约里允许的四类 feature；顺序固定，便于下游比对
 FEATURES = {
     "observation.state": {"dtype": "float32", "shape": (STATE_DIM,), "names": None},
@@ -49,8 +51,9 @@ FEATURES = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--demos", type=Path, default=Path("out/act_demos"), help="示教目录，含 index.json")
-    p.add_argument("--out", type=Path, default=Path("data/lerobot/act_pick_cube"), help="数据集输出根目录")
+    p.add_argument("--demos", type=Path, default=Path("out/act_demos_ee"), help="示教目录，含 index.json")
+    p.add_argument("--out", type=Path, default=Path("data/lerobot/act_pick_cube_ee"),
+                   help="数据集输出根目录")
     p.add_argument("--repo-id", type=str, default=REPO_ID, help="数据集 repo_id 标识")
     return p.parse_args()
 
@@ -131,17 +134,20 @@ def main() -> None:
         if not npz_path.is_file():
             sys.exit(f"[export] 错误: 缺少 {npz_path}")
         data = np.load(npz_path)
-        for key in ("qpos", "act", "t"):
+        for key in ("pose8_state", "pose8_action", "t"):
             if key not in data:
-                sys.exit(f"[export] 错误: {npz_path} 缺少数组 '{key}'")
-        state = data["qpos"].astype(np.float32)
-        action = data["act"].astype(np.float32)
+                sys.exit(f"[export] 错误: {npz_path} 缺少数组 '{key}'"
+                         f"（旧 7 维示教没有 EE 数组，请用 experiments/gen_act_dataset.py 重新生成）")
+        # 8 维 EE 契约: state 在动作前, action 在动作后 (见 §8), 不做任何坐标变换
+        state = data["pose8_state"].astype(np.float32)
+        action = data["pose8_action"].astype(np.float32)
         if state.shape[1] != STATE_DIM or action.shape[1] != ACTION_DIM:
-            sys.exit(f"[export] 错误: {ep_dir.name} qpos/act 形状为 {state.shape}/{action.shape}，"
-                     f"要求 (N,{STATE_DIM})/(N,{ACTION_DIM})")
+            sys.exit(f"[export] 错误: {ep_dir.name} pose8_state/pose8_action 形状为 "
+                     f"{state.shape}/{action.shape}，要求 (N,{STATE_DIM})/(N,{ACTION_DIM})")
         n = state.shape[0]
         if action.shape[0] != n:
-            sys.exit(f"[export] 错误: {ep_dir.name} qpos 与 act 帧数不一致: {n} vs {action.shape[0]}")
+            sys.exit(f"[export] 错误: {ep_dir.name} pose8_state 与 pose8_action 帧数不一致: "
+                     f"{n} vs {action.shape[0]}")
 
         images = {cam: load_images(ep_dir, cam) for cam in cams}
         for cam, frames in images.items():
