@@ -877,14 +877,20 @@ never_released / not_in_bowl / success`。`summary.json` 里除原有字段外�
 in_bowl_count / in_bowl_all / hold_err_max_m`，`criteria` 换成 place 的那一套
 （`release_sep_m / in_bowl_radius_m / in_bowl_z / max_ik_err_m / grasp_g_below / ctrl_limit`，
 **没有** `min_rise_m`），每 trial 多 `bowl_dxy_m / in_bowl / released / hold_err_m / cmd_g_last`。
+
+`bowl_xy_m` 和 `layout_m` 里的 `cube_xy0 / bowl_xy0` 描述的是**这批 trial 实际用的**
+布局：所有 trial 站在同一个 bowl 时就是那一对坐标；若某些 trial 的 bowl 不同（`--replay-demos`
+混了不同布局的数据集就会这样），`bowl_xy_m` 换成 `{"min", "max", "distinct"}`、
+`cube_xy0 / bowl_xy0` 给 `null`——逐 trial 的真值只认 `per_trial[i].cube_xy / .bowl_xy`。
+
 不带 `--task` 时（`lift`）产物与字段和 §9.4 逐位一致。
 
 ### 10.8 测试与本轮负向变异
 
 ```bash
 cd /home/zh/Desktop/EasyMimic/easymimic_repro
-/home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_dataset.py                                  # lift, 14317 checks
-/home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_dataset.py --dir out/act_demos_place         # place, 23425 checks
+/home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_dataset.py                                  # lift, 14378 checks
+/home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_dataset.py --dir out/act_demos_place         # place, 23486 checks
 /home/zh/miniconda3/envs/mujoco/bin/python tests_ee/test_act_rollout.py \
   --place-summary scratch/rollout_place_replay/summary.json                                              # 546 checks
 ```
@@ -903,3 +909,383 @@ cd /home/zh/Desktop/EasyMimic/easymimic_repro
 `--viewer` 在本轮**没有真的开过窗口**（用户桌面上不许弹窗）：`check_viewer_stub()` 把
 `play_in_viewer` 换成记录参数的 stub，验证「不带 `--viewer` 时不被调用」+「带时收到
 `(scene, traces, control_hz, passes)`、1 条 trace、形状 `(181, 14)`、`passes==3`」。
+
+## 11. 换桌子：cube / bowl 的坐标住在哪儿，怎么改
+
+前面每一节都默认 cube 在 `(0.474, 0.0435)`、碗在 `(0.300, -0.200)`。这一节说的是**换位置**：
+坐标一共住在五个地方，必须一起改，漏一处就会变成「场景按新坐标、表格按旧坐标」，IK 不报错，
+生成出来的数据全是错的。
+
+### 11.1 五个地方，一个都不能漏
+
+| # | 位置 | 内容 |
+|---|---|---|
+| 1 | `assets/jaka_zu3/scene_cube_bowl.xml:36` | `<body name="cube" pos="0.474 0.0435 0.815">`：cube 的初始位姿 |
+| 2 | 同文件 `:82` | 关键帧 `home` 的 qpos 尾巴：7 个手臂关节 + cube 自由关节的 `x y z qw qx qy qz` |
+| 3 | 同文件 `:47-64` | 碗的 17 个 geom：`bowl_bottom`（圆柱）+ `bowl_wall_00..15`（盒子，中心线半径 0.049，euler 绕 z 每 22.5°） |
+| 4 | `experiments/gen_act_dataset.py:118-119,139` | `CUBE_XY`、`CUBE_Z`、`BOWL_XY`，生成器和 `act_rollout.py` 都从这里取 |
+| 5 | `configs/waypoints_cube_lift.json`、`configs/waypoints_cube_place.json` | 抓取列（`approach/descend/close/lift/hold`）在 cube xy 上；place 表里 `carry/lower/release/retreat` 在碗 xy 上 |
+
+三件事容易踩：
+
+* 第 2 处是第 1 处的副本。只改 body 不改关键帧，`Replayer.home_qpos()` 会把 cube 拽回旧位置。
+* 第 3 处写的是**世界坐标**，不是 body 局部坐标（`<body name="bowl" pos="0 0 0">` 是空壳），
+  所以「搬碗」= 把这 17 个 `pos` 用同一个 delta 平移，`euler` 和 `size` 一位不动。
+* 五处由 `experiments/set_layout.py` 一次改完（§11.3），别手改。
+
+### 11.2 可达区（实测，只有运动学）
+
+判据：抓取姿态 `rotvec = [0, π, 0]`，site = `tool0`，IK 收敛（`solve` 不行再 `solve_robust`）
++ 六个关节都在限位内 + 位置残差 ≤ 2e-3 m + 角度残差 ≤ 2°。在 0.815 / 0.870 / 0.945 三个高度上
+扫出来的是**同一个集合**（绑定的是最高的 0.945）：
+
+| x | y 的可行范围 |
+|---|---|
+| 0.10 – 0.38 | ±0.36（探针边界，可能更宽） |
+| 0.40 | ±0.34 |
+| 0.42 | ±0.32 |
+| 0.44 | ±0.30 |
+| 0.46 | ±0.26 |
+| 0.48 | ±0.22 |
+| 0.50 | −0.18 … +0.16 |
+| 0.52 | ±0.10 |
+| ≥ 0.54 | 不可达 |
+
+台面 x −0.25…0.95、y −0.46…0.54、顶面 z = 0.80。现在的 cube `(0.474, 0.0435)` 和碗
+`(0.300, -0.200)` 都在里面。
+
+**这张表只有运动学，而且只是必要条件**：没算自碰撞（手臂撞台面、撞自己）、没算动力学，也
+不保证夹得住——0.50 附近 IK 全过，但夹爪会把方块推着走（见 11.6 的实测）。所以默认采样器
+**不按这张表取点**，用的是 §11.4 那两个按"真跑一集"量出来的安全盒；这张表仍然是
+`set_layout.py` 挡明显不可能的布局、以及 `--grasp-grid` 圈范围时的第一道闸。
+
+### 11.3 `experiments/set_layout.py`
+
+八个开关：`--cube X Y`（必填，除非要的是 `--grasp-grid` / `--sample` / `--sample-preview`）、
+`--bowl X Y`（默认取场景里 `bowl_bottom` 的当前值）、`--cube-z Z`（默认取场景当前值，即 0.815）、
+`--apply`、只测量不写盘的 `--grasp-grid SPEC`（见 11.6），以及给采样器看的 `--sample N`、
+`--sample-preview`、`--seed`（见 11.7）。
+
+默认**只看不写**：对 cube 列（0.815 / 0.910 / 0.935）和碗列（0.870 / 0.935 / 0.945）逐高度打
+一行 IK 判词（`conv/MISS`、位置残差、角度残差、关节是否在限位、rotvec），再打 cube-bowl 距离
+vs 碗外径 0.049 m、两个物体是否都还在台面上、五处是否自洽，最后一行 `PASS` / `FAIL`。
+**退出码就是判定**（0 = 过，非 0 = 不过），所以能直接塞进脚本。
+
+`--apply` 先跑同一套检查，`FAIL` 直接拒绝、一个字节都不写；过了才重写五处，重写完从磁盘重读、
+再检查一遍（`re-check on disk: PASS`），最后打印 `python -m mujoco.viewer --mjcf=...` 给你看。
+工具自己**从不调用 `mujoco.viewer`、不开任何窗口**——例外只有你显式点名的那条
+`--sample-preview`（见 11.7）；检查模式、`--grasp-grid`、`--sample` 依旧一个窗口都不开。
+
+改写是**按 token 换数字**：注释、缩进、JSON 键顺序、行内数组 vs 每行一个数的展开写法全部原样
+保留，数值没变的位置连 token 都不动——所以拿当前坐标 `--apply` 是零 diff（幂等），第二次
+`--apply` 会直接写 `wrote 0 of the 5 places`。碗的 17 个 geom 用同一个 delta 平移、仍写 6 位小数
+（源文件就是 6 位，环半径本身因此有 ≤ 3.3e-7 的舍入残差，平移一位不差地保留它）。
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+# 1) 只问「能不能放」，什么都不写；碗沿用场景里的当前值
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/set_layout.py --cube 0.500 0.100
+
+# 2) cube 和碗一起挪，检查通过才落盘，落盘后再自检一遍
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/set_layout.py \
+  --cube 0.500 0.100 --bowl 0.320 -0.280 --apply
+
+# 3) 搬回默认布局；搬回去之后再跑同样的命令就是 0 个文件被写
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/set_layout.py \
+  --cube 0.474 0.0435 --bowl 0.300 -0.200 --apply
+```
+
+### 11.4 `sample_layout`：训练和评测必须同一个分布
+
+生成器和 `act_rollout.py` 的随机化只能从一个函数出：
+
+```python
+sample_layout(rng) -> (cube_xy, bowl_xy)      # 两个绝对坐标，单位 m
+```
+
+默认实现是**连续均匀 + 一次拒绝**：cube 在 `CUBE_BOX` 里、碗在 `BOWL_BOX` 里各按轴独立
+`rng.uniform`（先 x 后 y），两个中心的距离小于 `MIN_SEP_M` 就把**两个一起**重抽（同一对 rng
+流，同种子同结果；`SAMPLE_MAX_TRIES = 1000` 次还抽不到就抛错）。三个常量：
+
+| 常量 | 值（m） | 为什么是这个框 |
+|---|---|---|
+| `CUBE_BOX` | x 0.455…0.485，y −0.090…0.130 | 抓取图上最大的全通过矩形是 x 0.450…0.490、y −0.100…0.140，四边再各收 5 mm / 10 mm。**x 停在 0.485**：再往右夹爪会推着方块走而不是夹住（IK 到 0.52 都收敛，见 11.6）；框内实测 `hold_err_m = 0.0006…0.0016 m` |
+| `BOWL_BOX` | x 0.310…0.415，y −0.235…0.295 | IK 图（0.870 / 0.935 / 0.945 三个高度）上最大的全通过矩形是 x 0.200…0.420、y −0.320…0.320，再各收 5 mm / 10 mm；**y 的下限另被前视相机裁掉**（y = −0.320 的碗角投到 v = 258 px，已经出了 256 px 画面）；**x 从 0.310 起**：碗越往小 x 放，release 段的沉降误差越大 |
+| `MIN_SEP_M` | 0.15 | 碗外径 0.049 m，0.15 让抓取列离碗壁还有 10 cm 量级 |
+
+这两条"往回缩"都不是洁癖，是量出来的：第一版连续采样用碗框 x 0.220…0.420 / y −0.240…0.300，
+12 次抽样只接受 6 次——6 个失败全部是**抓得好、放得歪**（`hold_err_m = 0.0004…0.0016 m`，
+但 `bowl_dxy_m = 0.0052…0.1101 m`），而且 6 个失败无一例外 `bowl x < 0.30`，成功的都在
+`x >= 0.30`。收到 x 0.300 之后 16 次抽样 16/16 通过，按上面这组框再抽 24 个布局真跑也是 24/24
+（其中故意包含 cube 框四个角、碗框四个角、12 个内部连续抽样、4 个正好压在
+`0.15 ± 0.004 m` 上的配对），四个角的投影也都还在前视画面里、至少留 12 px。
+
+"连续"是重点：**任何**落在框里的实数对都合法——没有网格、没有四舍五入、没有固定点表。自己写
+2-D 采样器时可以直接引用这三个常量，别退化成格子。
+
+* `experiments/act_rollout.py` 里的 `sample_offsets(rng)` 只是 `sample_layout(rng)` 的包装
+  （返回 `layout_offsets(cube_xy)`），**不许自己再写一份采样**，否则训练和评测会慢慢漂开。
+* 配套两个函数：`layout_table(base, cube_xy, bowl_xy)` 把抓取列搬到 `cube_xy`、把
+  `ANCHORED_LABELS`（`carry/lower/release/retreat`）搬到 `bowl_xy`，z 和时长一格不动；
+  `layout_table(base, CUBE_XY, BOWL_XY)` 与 `shifted_table(base, 0.0, 0.0)` 逐字段相等。
+  `place_bowl(rp, bowl_xy)` 平移碗的 17 个 `model.geom_pos` 再 `mj_forward`，中心没变就是空操作。
+* `meta.json` / `index.json` / `summary.json` 多记了 `cube_xy`、`bowl_xy`（旧字段 `dx`、`dy`、
+  `cube_pos` 含义不变）；`index.json` / `summary.json` 另外记了 `cube_box_m`、`bowl_box_m`、
+  `min_sep_m`。注意 `index.json` 里的 `cube_xy` / `bowl_xy` / `bowl_xy_m` 是**场景里写死的中心**
+  （XML 里那一份），不是某一集抽出来的位置——每集的真值在各 `ep%03d/meta.json` 里。
+  `--replay-demos` 用 meta 的 `cube_xy` / `bowl_xy` 还原布局；老 `meta.json` 没有这两个键时回落到
+  `cube_pos` 和 `BOWL_XY`，所以冻结的数据集照样能回放（它们的分布当然还是旧的 ±0.02）。
+* `RANDOM_X_M` / `RANDOM_Y_M`（±0.020 / ±0.005）**已经不是默认采样器的框**，只有 `legacy/`
+  还 import 它们写自己的 `randomization_m` 块。现行 `act_rollout.py` 的 summary 写的是
+  `layout_m: {cube_box_m, bowl_box_m, min_sep_m, cube_xy0, bowl_xy0}`，直接来自
+  `gen_act_dataset.CUBE_BOX / BOWL_BOX / MIN_SEP_M`。
+* 想换成自己的 2-D 采样器：**只改 `sample_layout` 这一处**，生成和回放同时变，别处不用动。
+
+### 11.5 本节新增的测试
+
+`tests_ee/test_act_dataset.py` 每跑一次多做 61 条检查（14317 → 14378；place 目录 23425 → 23486）：
+
+| 检查 | 内容 |
+|---|---|
+| `layout_table` 等价 | 两张表上 `layout_table(base, CUBE_XY, BOWL_XY)` 与 `shifted_table(base, 0, 0)` 逐字段（含 ee8 精确相等）一致 |
+| anchored 跟随 | `ANCHORED_LABELS` 的行落在 `bowl_xy`、其余落在 `cube_xy`，z / g / 四元数 / 时长不动 |
+| `place_bowl` | 17 个 geom 的 `model.geom_pos` 精确等于 `pos + delta`，环半径前后差 ≤ 1e-12，中心不变时是空操作 |
+| `sample_layout` | 2000 次抽样：每个 `cube_xy` 落在 `CUBE_BOX`、每个 `bowl_xy` 落在 `BOWL_BOX`、最小间距 ≥ `MIN_SEP_M`、cube 位置按 1e-6 取整后去重 ≥ 1990 个；同种子两次抽到的第一对相同 |
+| `--sample` | 子进程验证：`--sample 3` 退出 0 且正好打印 3 对布局（什么都不写） |
+| `set_layout.py` | 子进程验证：当前布局 `PASS` 退出 0；`--cube 0.60 0.00` 退出码非 0 且点名失败高度（0.815） |
+| 抓取网格 | 子进程验证：单点 `--grasp-grid` 退出 0 且打印 `1/1` 与单点耗时；`--grasp-grid` + `--apply` 被拒绝（退出码 2） |
+
+### 11.6 抓取质量网格：IK 通了不等于抓得住
+
+11.2 那张表只回答"IK 能不能到"，不回答"抓住之后会不会被甩掉"。实测：在默认立方体周围 42 个
+IK 全部通过（残差 < 1e-3 m）的点上各跑一条真实 place 轨迹，其中 **8 个把立方体推出了约
+28 mm**——要么 `hold_err_m` 超过 `MAX_HOLD_ERR_M = 0.002`，要么落点离碗心超过
+`bowl_dxy_m = MAX_BOWL_DXY_M = 0.005`。所以写 2-D 采样器时**要建在这张网格上，不是 11.2 的
+IK 表上**。
+
+`--grasp-grid` 就是同一判据的离线版：
+
+```bash
+python experiments/set_layout.py --grasp-grid "0.42:0.52:0.02,-0.08:0.16:0.04" --bowl 0.320 -0.280
+```
+
+* 每个格点跑一条真实轨迹（`gen_act_dataset.run_attempt(base, cube_xy=格点, bowl_xy=…,
+  render=False)`，不建渲染器，永远不开窗口），判定条件和生成器接受一集时**完全一样**：
+  `in_bowl` 且 `bowl_dxy_m <= MAX_BOWL_DXY_M` 且 `hold_err_m <= MAX_HOLD_ERR_M`。这几个常量
+  直接从 `gen_act_dataset` 取，没有第二份数字。
+* 输出：每个点的 `o` / `x`、`bowl_dxy_m`、`hold_err_m`、单点耗时；一行一个 y 的 `o/x` 地图
+  （y 从大到小）；`ok/total`；失败点清单。上面那 42 个点里有 8 个 `x`，例如
+  `(0.500, 0.100)` 是 `x`（`hold_err_m = 0.0286 m`，立方体被推走）、`(0.420, 0.120)` 是 `x`
+  （`bowl_dxy_m = 0.0055 m`，落在碗外），而 `(0.499, 0.100)`、`(0.460, 0.040)` 是 `o`。
+* 代价：每个点是一条完整轨迹，预算按 ~1.5 s/点算（本机实测 0.3–0.5 s/点，1.5 是留余量的
+  估计），因此**上限 400 点**，超了直接拒绝并打印点数和预估时间；400 点约 10 分钟。
+* 只测量、不落盘：每个点用 `tempfile.mkdtemp()` 的临时目录，跑完删掉；`out/`、`data/` 一律
+  不碰，`assets/`、`configs/` 也不碰（网格模式不写文件）。`--apply` 与 `--grasp-grid` 同时给
+  会直接拒绝（退出码 2）。
+* 退出码：网格跑完就是 0，哪怕有 `x`——地图本身就是答案，`x` 是测量结果而不是工具失败。
+  原来的检查模式（PASS/FAIL）和 `--apply` 的退出码不变。
+
+顺序建议：先用 `--grasp-grid` 圈出"够得到又抓得住"的区域，再在这个区域里写你自己的
+`sample_layout`（见 11.4）。
+
+### 11.7 在 MuJoCo 里看随机布局
+
+采样器长什么样，最快的办法是让它抽几个给你看：
+
+```bash
+cd /home/zh/Desktop/EasyMimic/easymimic_repro
+
+# 1) 抽 5 个布局只打印：每对的 cube / 碗坐标、实际抽到的范围、最小间距
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/set_layout.py --sample 5
+
+# 2) 换种子再抽 20 个
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/set_layout.py --sample 20 --seed 3
+
+# 3) 抽 1 个布局并直接开窗口：cube 和碗已经被摆到抽到的位置上
+/home/zh/miniconda3/envs/mujoco/bin/python experiments/set_layout.py --sample-preview
+```
+
+`--sample N` 的每一对都来自生成器那份 `sample_layout`（不是另抄一份），打完最后一行会给实际
+抽到的 cube x/y、碗 x/y 范围和最小间距；**什么都不写**，纯打印。种子相同、N 相同，输出就相同。
+
+`--sample-preview` 抽一个布局，先把坐标打出来，然后在内存里把它摆上去（`place_bowl()` 平移碗的
+17 个 geom，cube 用生成器同一个 `place_cube_abs()` 落到 0.815 m），再开
+`mujoco.viewer.launch_passive`。你会看到台面上一个方块、一个碗，位置就是打印出来的那一对；
+鼠标拖动转视角，关窗口就退出。它是**静态快照**：物理不步进、不生成 episode、不写任何文件。
+
+这是 `set_layout.py` 里唯一会开窗口的路径，只在显式给了 `--sample-preview` 时才跑；`--apply` 和
+`--grasp-grid` 都不能跟它一起用（会被直接拒绝，退出码 2），测试里也没有任何一条会调用它。
+（仓库别处本来就有窗口路径——`experiments/act_rollout.py --viewer`、
+`experiments/hand_teleop_live.py`、`legacy/act_rollout_joint7.py`——那些是策略回放和示教用的，
+跟布局工具无关。）
+
+看的时候请记住这些框**没有**保证什么：
+
+* **不看自碰撞**：手臂会不会撞台面、撞碗、撞自己，这里完全没有建模。框里的点都是"IK 可达
+  且真跑一集通过"的经验结果，不是"不可能撞"的保证。
+* **只在 cube z = 0.815 上验证过**（台面 0.80 + 半个方块 0.015）。换 `--cube-z` 之后要重新量。
+* **前视相机**只保证了 12 px 的边缘余量；相机改一点、或者碗压着 `BOWL_BOX` 的 y 下限，画面里
+  就可能只剩半个碗。
+* 框是**真跑一集**量出来的，量的是"这一套 waypoint 表 + 这一组速度"。改了 waypoint 表（时长、
+  途经点、`rotvec`）之后，要先用 `--grasp-grid` 重新圈区域再定框。
+
+
+## 12. 随机布局：生成 → 训练 → 评测（现行主线）
+
+§11 的采样器落地之后，方块与碗每集都在 `CUBE_BOX`/`BOWL_BOX` 里连续均匀重抽，间距 ≥
+`MIN_SEP_M`。这一节是与之配套的训练与评测口径。
+
+### 12.1 为什么固定布局训出来的权重不能直接用
+
+`out/act_train_place_20k/checkpoints/006000`（固定布局时代的最佳检查点，固定布局 80/80）
+在新随机分布上跑 20 次：**0/20**，全部 `not_in_bowl`，`bowl_dxy` **0.1569–0.4738 m**，
+`hold_err` 最大 0.3703 m，`released` 20/20。也就是说它每次都把方块搬到**旧的**碗位置
+(0.300, −0.200)，方块照样被夹住、松开，只是放错了地方。固定布局的表现不能外推到随机布局，
+必须用随机布局数据重训。
+
+### 12.2 数据
+
+| 项 | 值 |
+|---|---|
+| 目录 | `out/act_demos_place_rand`（60 条 × 181 帧） |
+| lerobot | `data/lerobot/act_pick_place_rand`（`num_episodes 60`、`num_frames 10860`、20 fps） |
+| 接口 | `action (8,)` / `observation.state (8,)`，两路 256×256 相机 |
+| 生成验收 | 60/60 首次尝试即接受，`in_bowl 60/60`、`bowl_dxy 0.00193–0.00488`、`hold_err ≤0.00098`、IK ≤9.99e-04 |
+
+```bash
+experiments/gen_act_dataset.py --table configs/waypoints_cube_place.json \
+    --out out/act_demos_place_rand --episodes 60
+scripts/export_lerobot_dataset.py --demos out/act_demos_place_rand \
+    --out data/lerobot/act_pick_place_rand --repo-id local/act_pick_place_rand
+```
+
+### 12.3 训练（一条命令）
+
+`scripts/train_act.py` 把路径与 20K 配方固定在脚本里（`dataset.root` 绝对路径、`HF_HOME`
+指向仓库内缓存、`push_to_hub=false`），命令行只留会调的旋钮：
+
+```bash
+# 全量 20K（GPU）
+/home/zh/miniconda3/envs/lerobot/bin/python scripts/train_act.py --device cuda
+
+# 只打印将要执行的 lerobot 命令
+/home/zh/miniconda3/envs/lerobot/bin/python scripts/train_act.py --dry-run
+```
+
+默认值：`--steps 20000 --batch-size 8 --num-workers 8 --save-freq 2000 --seed 1000
+--out-dir out/act_train_place_rand`；学习率用 lerobot 默认 1e-5（CLI 里只有
+`--policy.optimizer_lr`，没有 lr_scheduler）。
+
+两条硬约束：
+
+* **输出目录不覆盖**。lerobot 在 `resume=False` 下遇到非空 `output_dir` 会直接抛错，
+  `scripts/train_act.py` 提前拦下并提示换目录，不会静默续训。
+* **训练前先看 `--dry-run` 打印的 `episodes/frames`**：数据目录指错时唯一不报错的症状就是
+  它悄悄训了另一套数据。
+
+### 12.4 评测与可视化（训练完的权重）
+
+```bash
+# 20 次随机布局，写 mp4 + PNG 关键帧，打印汇总
+/home/zh/miniconda3/envs/lerobot/bin/python experiments/act_rollout.py --task place \
+    --ckpt out/act_train_place_rand/checkpoints/last/pretrained_model \
+    --trials 20 --device cpu
+
+# 跑完在 MuJoCo 窗口里按 20 Hz 重放这条轨迹（窗口自己开，跑完关窗退出）
+/home/zh/miniconda3/envs/lerobot/bin/python experiments/act_rollout.py --task place \
+    --ckpt out/act_train_place_rand/checkpoints/last/pretrained_model \
+    --trials 1 --device cpu --viewer
+```
+
+每次 trial 的布局是当场用 `sample_layout` 抽的，逐 trial 的真值在 `summary.json.per_trial[*]
+.cube_xy/.bowl_xy`，汇总的框在 `summary.json.layout_m`；产物默认落
+`out/act_rollout_place/`（`trial_XX.mp4` + `trial_XX_{0000,0025,…}.png`，左 front、右 wrist）。
+
+### 12.5 看结果看哪几个字段
+
+* `successes/trials` + `outcomes`：判据是 `in_bowl` 且 `released`（末帧方块离 tool0 ≥
+  `RELEASE_SEP_M` 0.05 m），**不看**指令 g 的末值——策略的 g 头系统性偏低。
+* `bowl_dxy_min_m/max_m`：落点误差，碗内半径 0.045 m、判据 `IN_BOWL_RADIUS_M` 0.030 m。
+* `hold_err_max_m`：最后一个"指令 g==0"拍上方块与 tool0 的水平距离，抓取质量的独立探针。
+* `release_sep_m` / `criteria`：本次用的阈值，别用文档里的数字替代 summary 里的。
+
+随机布局下的成功率天然低于固定布局（同一批权重、同一套判据），比较时必须**同分布同 trial 数**
+才有意义；`--seed` 固定抽样序列。
+
+### 12.6 本节没有保证的东西
+
+只验证过一条 waypoint 表（`configs/waypoints_cube_place.json`）与 z=0.815 的方块；自碰撞没建模；
+前视相机只留 12 px 边缘余量；`--viewer` 的窗口循环没有在本仓库的 CI 里跑过（需要人开窗口）。
+
+### 12.7 检查点扫描：`last` 不是最好的那个
+
+`out/act_train_place_rand` 训完 20000 步（loss 2.4→0.099，grdn ~12）后，把 10 个检查点各跑
+20 次同批随机布局（`--seed 0`，布局逐 trial 完全相同，已验证），再对前几名加到 4 个 seed ×
+20 次 = 80 次。判据是"方块落在碗里（`in_bowl`，见 §12.8 的半径口径）且已脱离夹爪"，
+括号里的 **seated** 是更严的一档：落在 `IN_BOWL_SEATED_R_M = 0.030` 内（贴地而不是靠着碗壁）。
+
+| checkpoint | seed 0 判据成功 | 4 seed 合计（seated） | `bowl_dxy` 均值 / 最大 | `hold_err` 最大 |
+|---|---|---|---|---|
+| 002000 | 14/20 | 41/80 51% (26) | 0.0517 / 0.1967 | 0.2626 |
+| **006000** | **19/20** | **67/80 84% (43)** | **0.0217 / 0.0619** | **0.0256** |
+| 010000 | 17/20 | 58/80 72% (37) | 0.0315 / 0.0909 | 0.3014 |
+| 014000 | 19/20 | 61/80 76% (44) | 0.0201 / 0.0474 | 0.1918 |
+| 018000 | 17/20 | — | 0.0351 / 0.0494 | 0.0250 |
+| 020000 (`last`) | 13/20 | — | 0.0523 / 0.3100 | 0.2666 |
+
+结论与口径：
+
+* **选 006000**：4 seed 下进碗率最高（84%），判据成功率与 014000 打平，但 `hold_err` 最大只有
+  0.026 m（014000 0.192 m，出现过中途脱手），落点也没有 014000 那种 0.19 m 的离群值。
+* **训练 loss 与闭环成功率脱钩**：loss 一路降到 0.099，但 16k/18k/20k 只有 13–18/20（seed 0）。
+  后段检查点变差不是"过拟合到 loss"，而是闭环里越走越偏；**用 `last` 会挑到较差的之一**。
+* **seed 方差很大**（006000 逐 seed 19/10/9/9 在新口径下）。任何单 seed 的 20 次成绩都不能当结论。
+* 默认 checkpoint 是 `out/act_train_place_rand/checkpoints/006000/pretrained_model`
+  （`PLACE_CKPT`，见 `experiments/act_rollout.py:107`），`--task place` 不传 `--ckpt` 就是它。
+* summary 里同时给两个数：`in_bowl_count`（碗内半径口径）与 `seated_count`（30 mm 坐实口径），
+  逐 trial 还有 `in_bowl` / `seated`。
+
+### 12.8 判据与测试口径（这一轮一并改的）
+
+* **判据半径改了（2026-11-01，用户拍板）**：`IN_BOWL_RADIUS_M` 从 0.030 改成
+  `BOWL_INNER_R_M`（0.045），理由是把方块滑到碗里、靠着碗壁也算进碗。更严的"坐实在地上"
+  保留为 `IN_BOWL_SEATED_R_M = 0.030`，summary 与逐 trial 都两个都给。006000 因此在 seed 0 是
+  19/20、4 seed 84%（严格口径 54%）。
+* `tests_ee/test_act_rollout.py` 里"判成功就该落在碗里"这道门，从 `MAX_BOWL_DXY_M`（5 mm）改成
+  `IN_BOWL_RADIUS_M`（30 mm）：5 mm 是**生成器**的接受门，由 `test_act_dataset.py` 对着
+  `meta.json` 卡；重放同一批动作仍会漂（随机数据集实测 7.1 mm），拿它卡回放会误报。
+* 同一文件里策略模式的**汇总级**检查不再要求每个 trial 都成功（策略跑失败是它要测量的东西），
+  只要求：`in_bowl_count` 与 per-trial 一致、`bowl_dxy_max_m` 等于 per-trial 的最大值（按
+  summary 的 6 位小数取整比较）。成功 trial 的质量门仍在 per-trial 里逐条查。
+* `tests_ee/test_act_dataset.py` 里 place episode 的 `rise` 下界从 `0` 放到 `-1e-3`：碗随随机布局
+  移动，方块落到碗底时可能比起点低 0.04 mm（60 条实测 `-0.00004 .. +0.00196`）。
+
+复验：默认（策略 1 trial）338 checks、示教重放 20 条 553 checks、策略 20 条（含失败）531 checks、
+最差检查点 020000 491 checks，全部 EXIT 0；把某个成功 trial 的 `in_bowl` 改成 False 的变异 EXIT 1。
+
+### 12.9 修掉的坑：窗口里碗没跟着搬
+
+`--viewer` 的窗口是**另起一个进程内模型**（`mujoco.MjModel.from_xml_path(SCENE)`），而每集
+trial 的碗位置是运行时改 `model.geom_pos` 得到的。旧实现只把 qpos 帧喂给窗口，没有把碗搬到
+那一集的布局上，于是：**随机布局下，窗口里的碗一直待在场景默认 (0.300, −0.200)，方块按轨迹
+飞到它自己那一集的碗位——看起来就像"从来没放进碗里"，而 summary 里 in_bowl 是 True**。
+mp4 / PNG 不受影响（它们在 rollout 进程里渲染，碗是搬过的）。
+
+修法：`play_in_viewer(scene, traces, control_hz, passes)` 的 `traces` 改成 `(bowl_xy, frames)`
+二元组，播每一集之前先 `place_bowl`（只用到 `.model`/`.data`，窗口模型够用）。
+
+复验（headless，不开窗）：窗口模型里碗底 geom 从 `0.30000 −0.20000` 移到 `0.39570 −0.23350`
+（17 个碗 geom 全平移，误差 0.00e+00）；同一 trial 的末帧方块 `[0.4034, −0.2531, 0.8149]` 到
+**窗口里**的碗心距离 0.0211 m，与 summary 记录的 `bowl_dxy_m 0.0210` 一致；策略路径同样成立
+（2 次均 success，窗口碗位 = trial 碗位）。测试里加了回归断言：`traces[0][0]` 必须等于该
+trial summary 里的 `bowl_xy`。
+
+正确的看窗口方式：
+
+```bash
+/home/zh/miniconda3/envs/lerobot/bin/python experiments/act_rollout.py --task place \
+    --trials 20 --device cpu --viewer --viewer-passes 1
+```
+
+`--viewer-passes 1` = 20 集依次各播一遍然后退出；`--viewer-passes 0`（默认）= 一直循环到关窗。
+窗口标题栏和终端第一行 `[roll] ckpt=...` 都会打印用的是哪个权重。

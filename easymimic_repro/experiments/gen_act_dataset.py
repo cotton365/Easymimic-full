@@ -1,18 +1,40 @@
 #!/usr/bin/env python3
 """Generate ACT training episodes on scene_cube_bowl: pick-and-lift, or pick-and-place.
 
-One episode = an 8-D waypoint table replayed at CONTROL_HZ against a cube whose xy has been
-shifted by one random offset; every waypoint that chases the cube is shifted by the same
-offset, so the grasp column follows the cube.  The cube keeps its spawn height (0.815 m =
-table top 0.80 + half height 0.015) and its yaw.
+One episode = an 8-D waypoint table replayed at CONTROL_HZ against a cube and a bowl that have
+been put at one drawn layout; every waypoint that chases the cube is re-seated on the cube and
+the four ANCHORED_LABELS waypoints on the bowl, so the grasp column follows the cube and the
+release column follows the bowl.  The cube keeps its spawn height (0.815 m = table top 0.80 +
+half height 0.015) and its yaw.
 
---table picks the table and with it the task.  configs/waypoints_cube_place.json ends over
-the bowl at (0.300, -0.200); the default stays the lift table.  The table's own labels
-decide which task it is, not a flag: a table carrying any of ANCHORED_LABELS is the place
-task, because those four waypoints live over the bowl and the bowl does NOT move with the
-cube offset - only approach/descend/close/lift ride along with the cube.  The lift table has
-none of those labels, so its episodes stay bit-identical to the ones this script produced
-before the place task existed: same npz keys, same meta/index/summary keys, same numbers.
+--table picks the table and with it the task.  The default stays the lift table.  The table's
+own labels decide which task it is, not a flag: a table carrying any of ANCHORED_LABELS is the
+place task, because those four waypoints live over the bowl.  The lift table has none of those
+labels, so its episodes carry only the cube half of the layout (the bowl is still put at the
+sampled centre, it is simply never approached).  npz keys, numbers and meta/index/summary keys
+are the same for both tasks, plus the layout pair (cube_xy/bowl_xy) they record.
+
+Where the cube and the bowl sit for one episode is decided by exactly one function:
+
+    sample_layout(rng) -> (cube_xy, bowl_xy)
+
+It draws cube_xy uniformly (continuous, one rng.uniform per axis, x then y) inside CUBE_BOX,
+bowl_xy uniformly inside BOWL_BOX, and redraws *both* until the two centres are at least
+MIN_SEP_M apart.  The boxes are the measured-safe region, not the whole reachable one - the
+constant comments below say what each bound was measured against and docs/ACT_PIPELINE.md
+section 11.4 has the numbers behind them.  "Continuous" is the point: every real pair inside
+the boxes is legal, there is no grid, no rounding and no fixed point list, so a sampler built
+on these bounds can produce any layout the boxes contain.
+
+layout_table() re-seats a table on an arbitrary absolute pair (the grasp column follows the
+cube, ANCHORED_LABELS follow the bowl, z and durations untouched) and place_bowl() moves the
+bowl's 17 static geoms before the first tick, so the episode loop needs nothing else.
+experiments/act_rollout.py calls the same sample_layout, so training and evaluation cannot
+sample different distributions, and --replay-demos restores an episode's layout from its
+meta.json (cube_xy/bowl_xy; a meta.json predating them falls back to cube_pos and BOWL_XY)
+instead of resampling it.  meta.json keeps cube_pos with its old meaning and gains
+cube_xy/bowl_xy; summary.json's per-episode rows keep dx/dy (now derived from the sampled
+centre) and gain the absolute pair.  The data.npz keys and numbers are unchanged.
 
 The place task adds three measurements, written to data.npz, meta.json, index.json and
 summary.json (in index.json they are the worst case over the episodes it describes):
@@ -56,9 +78,10 @@ qpos[k] and pairs with pose8_state[k].  write_png is the hand-rolled writer from
 src/pose_cmd/replay.py (no PIL in this env); row 0 is the top of the picture.
 
 An attempt is thrown away and resampled when the lifted cube ends lower than MIN_RISE_M,
-when any IK residual exceeds MAX_IK_ERR_M, or when an IK solve fails outright - so the
-output directory only ever holds successful grasps.  Same --seed -> same offsets -> the
-same physics -> bit-identical qpos (nothing here reads the clock or a thread pool).
+when any IK residual exceeds MAX_IK_ERR_M, when an IK solve fails outright, or when a place
+episode misses the place gate (see PLACE_METRICS below) - so the output directory only ever
+holds successful episodes.  Same --seed -> same drawn layouts -> the same physics ->
+bit-identical qpos (nothing here reads the clock or a thread pool).
 
 The output directory is rebuilt from scratch on every run.
 """
@@ -67,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -101,8 +125,36 @@ FK_TOL = 1e-9                # recorded qpos -> FK must reproduce pose8 to this,
 CUBE_XY = (0.474, 0.0435)    # cube body xy in the scene = the table's grasp column
 CUBE_Z = 0.815               # table top 0.80 + half height 0.015
 
-# Measured (scratch/sweep_xy.py): every dx in +-0.030 and dy in +-0.006 lifts the cube,
-# rise 0.1183..0.1193 m, slip <= 6.0e-4 m.  The published range keeps a margin.
+# The layout sampler's boxes, (XMIN, XMAX, YMIN, YMAX) in metres.  These are the measured-SAFE
+# region, not merely the reachable one; every bound below came from a measurement:
+#   CUBE_BOX  grasp map - one real place episode per point over x 0.42..0.52 step 0.01 and
+#             y -0.10..0.16 step 0.02; the largest all-pass rectangle was x 0.450..0.490,
+#             y -0.100..0.140 (hold_err_m 0.0006..0.0016 m inside it), pulled in by 5 mm in x
+#             and 10 mm in y.  x stops at 0.485 because past it the pads push the cube instead
+#             of holding it, while IK still converges out to ~0.52 - exactly the trap the grasp
+#             map exists to close.
+#   BOWL_BOX  IK map at the three bowl heights (0.870/0.935/0.945; pos <= 2e-3 m, ang <=
+#             2 deg) - largest all-pass rectangle x 0.200..0.420, y -0.320..0.320, pulled in by
+#             5 mm in x and 10 mm in y; the -y side is then clipped by the front camera, which
+#             projects a bowl corner at y = -0.320 to v = 258 px, i.e. out of the 256 px frame.
+#             x starts at 0.310, not 0.205: the release segment's settling error grows as the
+#             bowl moves away from the arm root, so bowls at x < 0.30 failed the place gate on
+#             the drop (bowl_dxy_m 0.0052..0.1101 m) while every bowl at x >= 0.30 passed, with
+#             a good grasp in both cases (hold_err_m 0.0004..0.0016 m).
+#   24 draws from exactly these boxes - all four cube corners, all four bowl corners, 12
+#   interior pairs and 4 pairs on the separation bound - were all accepted, and all four corner
+#   projections stay inside the front camera frame with >= 12 px to spare.
+CUBE_BOX = (0.455, 0.485, -0.090, 0.130)
+BOWL_BOX = (0.310, 0.415, -0.235, 0.295)
+MIN_SEP_M = 0.15             # smallest legal cube-bowl centre distance (bowl outer radius is
+                             # 0.049 m, so 0.15 keeps the grasp column clear of the wall ring)
+SAMPLE_MAX_TRIES = 1000      # redraws both centres per try; the cap is a bug detector, not an
+                             # expected path - a legal pair is the overwhelmingly likely draw
+
+# NOT used by sample_layout() any more: the sampler draws inside CUBE_BOX/BOWL_BOX, and the
+# +-0.020 x +-0.005 box these describe is historical.  Only legacy/act_rollout_joint7.py still
+# imports them (for its own summary.json "randomization_m" block); experiments/act_rollout.py
+# now reports layout_m = {cube_box_m, bowl_box_m, min_sep_m}.  Never read these as the bounds.
 RANDOM_X_M = 0.020
 RANDOM_Y_M = 0.005
 
@@ -119,9 +171,15 @@ PLACE_TASK = "pick up the red block and put it in the bowl"
 # is shifted, which is what the pre-place-task episodes were generated with.
 ANCHORED_LABELS = ("carry", "lower", "release", "retreat")
 
-BOWL_XY = (0.300, -0.200)    # bowl centre in the scene
+BOWL_XY = (0.3, -0.2)    # bowl centre in the scene
 BOWL_INNER_R_M = 0.045       # bowl inner radius; wall top z = 0.840, floor z = 0.802
-IN_BOWL_RADIUS_M = 0.030     # inside the rim with margin, so a rim rest does not count
+BOWL_OUTER_R_M = 0.049       # wall ring centreline; the bowl's footprint radius (+ wall)
+BOWL_GEOM_PREFIX = "bowl_"   # the bowl's geoms: bottom disc + bowl_wall_00 .. _15
+IN_BOWL_RADIUS_M = BOWL_INNER_R_M
+# Judge == the bowl's own aperture: a cube that slid down and is leaning on the wall counts as
+# in the bowl (decision taken 2026-11-01; it used to be 0.030). The stricter "resting flat on the
+# floor" reading is kept next to it so both counts can be reported for the same trial.
+IN_BOWL_SEATED_R_M = 0.030   # centre here or closer = the cube sits on the floor, not on the wall
 IN_BOWL_Z = (0.800, 0.840)   # cube centre while it rests in the bowl (0.817 on the floor)
 
 MAX_BOWL_DXY_M = 0.005       # place gate: the cube must land this close to the bowl centre
@@ -152,13 +210,127 @@ def shifted_table(base, dx, dy):
                  control_hz=CONTROL_HZ, waypoints=tuple(waypoints))
 
 
-def place_cube(rp, dx, dy):
-    """Replayer.teleport() rewrites the free joint from the home keyframe, so the cube is
-    put back afterwards - once, before the first tick."""
-    rp.data.qpos[7:10] = [CUBE_XY[0] + dx, CUBE_XY[1] + dy, CUBE_Z]
+def layout_table(base, cube_xy, bowl_xy):
+    """The template table re-seated on an absolute (cube_xy, bowl_xy) pair.
+
+    The waypoints that chase the cube take cube_xy, the ANCHORED_LABELS waypoints take
+    bowl_xy (that is what "anchored over the bowl" means once the bowl itself can move);
+    every other waypoint rides along with the cube column.  z, orientation and durations are
+    copied through untouched, so this is shifted_table() for a scene whose objects may have
+    moved: layout_table(base, CUBE_XY, BOWL_XY) is shifted_table(base, 0.0, 0.0).
+    """
+    waypoints = []
+    for w in base.waypoints:
+        ee8 = np.array(w.ee8, dtype=float)
+        xy = bowl_xy if w.label in ANCHORED_LABELS else cube_xy
+        ee8[0] = float(xy[0])
+        ee8[1] = float(xy[1])
+        waypoints.append(Waypoint(label=w.label, ee8=ee8, duration_s=w.duration_s))
+    return Table(source=base.source, frame=base.frame, units=base.units,
+                 control_hz=CONTROL_HZ, waypoints=tuple(waypoints))
+
+
+def layout_offsets(cube_xy):
+    """(dx, dy) of a sampled cube centre relative to CUBE_XY - the offset the reporting uses.
+
+    The sampler returns absolute centres, so the offset is derived here rather than drawn;
+    the subtraction is exact to one ulp of CUBE_XY and is never fed back into the physics
+    (place_cube_abs() takes the centre, not the offset), so trajectories do not depend on it.
+    """
+    return (float(cube_xy[0] - CUBE_XY[0]), float(cube_xy[1] - CUBE_XY[1]))
+
+
+def sample_layout(rng):
+    """One episode's (cube_xy, bowl_xy): THE distribution, for training and for evaluation.
+
+    Continuous uniform over two measured-safe boxes, plus one rejection step:
+
+        cube_xy ~ U(CUBE_BOX[0..1] x CUBE_BOX[2..3])      x drawn first, then y
+        bowl_xy ~ U(BOWL_BOX[0..1] x BOWL_BOX[2..3])
+        both redrawn until hypot(cube_xy - bowl_xy) >= MIN_SEP_M
+
+    Nothing is quantised: every real pair inside the boxes is a legal output, there is no grid
+    and no fixed point list.  "Safe" was measured against a real episode per point - the cube
+    box is the all-pass rectangle of the grasp map (hold_err_m: the cube is still between the
+    pads) and the bowl box is the all-pass rectangle of the IK map at the three bowl heights
+    (0.870/0.935/0.945), clipped in -y so the front camera still sees a bowl corner and at
+    x >= 0.310 where the drop stopped failing; see the CUBE_BOX/BOWL_BOX comments above and
+    docs/ACT_PIPELINE.md section 11.4.  None of it says anything about self-collision, which
+    is not modelled here at all - nor about cube heights other than CUBE_Z.
+
+    Deterministic given the rng: same seed -> same first pair, same stream order for every
+    caller.  layout_table(), place_bowl(), meta.json and index.json all take whatever this
+    returns, and experiments/act_rollout.py calls it too, so a rollout samples the same
+    distribution as the demos it is scored on.
+    """
+    for _try in range(SAMPLE_MAX_TRIES):
+        cube_xy = (float(rng.uniform(CUBE_BOX[0], CUBE_BOX[1])),
+                   float(rng.uniform(CUBE_BOX[2], CUBE_BOX[3])))
+        bowl_xy = (float(rng.uniform(BOWL_BOX[0], BOWL_BOX[1])),
+                   float(rng.uniform(BOWL_BOX[2], BOWL_BOX[3])))
+        if math.hypot(cube_xy[0] - bowl_xy[0], cube_xy[1] - bowl_xy[1]) >= MIN_SEP_M:
+            return cube_xy, bowl_xy
+    raise RuntimeError("sample_layout: no pair with cube-bowl >= %r m in %d tries "
+                       "(CUBE_BOX %r, BOWL_BOX %r)"
+                       % (MIN_SEP_M, SAMPLE_MAX_TRIES, CUBE_BOX, BOWL_BOX))
+
+
+def place_cube_abs(rp, cube_xy):
+    """place_cube() for an absolute centre instead of an offset from CUBE_XY."""
+    rp.data.qpos[7:10] = [float(cube_xy[0]), float(cube_xy[1]), CUBE_Z]
     rp.data.qpos[10:14] = [1.0, 0.0, 0.0, 0.0]
     rp.data.qvel[:] = 0.0
     mujoco.mj_forward(rp.model, rp.data)
+
+
+def place_cube(rp, dx, dy):
+    """Replayer.teleport() rewrites the free joint from the home keyframe, so the cube is
+    put back afterwards - once, before the first tick."""
+    place_cube_abs(rp, (CUBE_XY[0] + dx, CUBE_XY[1] + dy))
+
+
+def bowl_geom_ids(model):
+    """Ids of the bowl's geoms - bottom disc plus the 16 wall boxes, by name prefix."""
+    ids = []
+    for gid in range(model.ngeom):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+        if name is not None and name.startswith(BOWL_GEOM_PREFIX):
+            ids.append(gid)
+    return ids
+
+
+def bowl_bottom_id(model):
+    return int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "bowl_bottom"))
+
+
+def place_bowl(rp, bowl_xy):
+    """Move the bowl to bowl_xy; a no-op when it already sits there.
+
+    The bowl has no joint - it is 17 worldbody geoms - so "moving" it is translating every
+    one of its geoms by the same delta and re-running the kinematics.  mj_forward rebuilds
+    geom_xpos and every contact from the new geom_pos, so collision geometry really moves
+    (the static geoms carry no dof and no inertia the solver integrates).  One caveat is the
+    same one the bowl has always had: ncon scratch and warm-start are rebuilt from scratch on
+    the next step, and the caller runs this before the first tick, not mid-episode.
+    """
+    model = rp.model
+    bottom = bowl_bottom_id(model)
+    dx = float(bowl_xy[0]) - float(model.geom_pos[bottom][0])
+    dy = float(bowl_xy[1]) - float(model.geom_pos[bottom][1])
+    if dx == 0.0 and dy == 0.0:
+        return
+    for gid in bowl_geom_ids(model):
+        pos = model.geom_pos[gid]
+        pos[0] = pos[0] + dx
+        pos[1] = pos[1] + dy
+    mujoco.mj_forward(model, rp.data)
+
+
+def bowl_center(model):
+    """The bowl's centre as the model currently holds it (the bottom disc's xy)."""
+    pos = model.geom_pos[bowl_bottom_id(model)]
+    return (float(pos[0]), float(pos[1]))
+
 
 
 def hinge_g(q7):
@@ -223,16 +395,18 @@ def fk_selfcheck(model, site_id, qpos_rows, state8):
     return max_pos, max_quat
 
 
-def run_attempt(base, dx, dy, ep_dir, render):
-    """One episode. Returns the measurement dict; writes data.npz and meta.json into
-    ep_dir (the caller renames it into place only if the attempt is accepted)."""
-    traj = plan_trajectory(shifted_table(base, dx, dy))
+def run_attempt(base, cube_xy, bowl_xy, ep_dir, render):
+    """One episode at the layout (cube_xy, bowl_xy). Returns the measurement dict; writes
+    data.npz and meta.json into ep_dir (the caller renames it into place only if the attempt
+    is accepted)."""
+    traj = plan_trajectory(layout_table(base, cube_xy, bowl_xy))
     task = table_task(base)
     rp = Replayer(scene_path=os.path.join(REPO, SCENE), control_hz=CONTROL_HZ,
                   render_every=0)
     renderer = None
     try:
         model = rp.model
+        place_bowl(rp, bowl_xy)
         os.makedirs(ep_dir, exist_ok=True)
         cams = []
         if render:
@@ -244,7 +418,7 @@ def run_attempt(base, dx, dy, ep_dir, render):
         first = np.asarray(traj.ee8[0], dtype=float)
         res0 = rp.solve_frame(traj.label[0], first[0:3], first[3:6], rp.home_qpos())
         rp.teleport(np.array(res0.qpos, dtype=float), float(first[6]))
-        place_cube(rp, dx, dy)
+        place_cube_abs(rp, cube_xy)
         cube_start = rp.cube_pos()
         cube_quat = np.array(rp.data.xquat[rp.cube_body], dtype=float)
 
@@ -297,7 +471,8 @@ def run_attempt(base, dx, dy, ep_dir, render):
             if not np.isfinite(hold_err):
                 raise AssertionError("place table never commands a closed gripper: "
                                      "hold_err_m undefined")
-            bowl_dxy = float(np.hypot(cube_end[0] - BOWL_XY[0], cube_end[1] - BOWL_XY[1]))
+            bowl_dxy = float(np.hypot(cube_end[0] - float(bowl_xy[0]),
+                                      cube_end[1] - float(bowl_xy[1])))
             place = {"bowl_dxy_m": bowl_dxy,
                      "in_bowl": bool(bowl_dxy < IN_BOWL_RADIUS_M
                                      and IN_BOWL_Z[0] < float(cube_end[2]) < IN_BOWL_Z[1]),
@@ -360,7 +535,9 @@ def run_attempt(base, dx, dy, ep_dir, render):
         result = {"num_frames": n, "rise_m": rise, "slip_m": slip, "ik_err_m": ik_err,
                   "fk_err_m": max(fk_max_pos, fk_max_quat), "quat_min_dot": quat_min_dot,
                   "state_action_min_dot": same_tick_dot,
-                  "cube_pos": [float(CUBE_XY[0] + dx), float(CUBE_XY[1] + dy), float(CUBE_Z)]}
+                  "cube_pos": [float(cube_xy[0]), float(cube_xy[1]), float(CUBE_Z)],
+                  "cube_xy": [float(cube_xy[0]), float(cube_xy[1])],
+                  "bowl_xy": [float(bowl_xy[0]), float(bowl_xy[1])]}
         result.update(place)
         return result
     finally:
@@ -369,12 +546,14 @@ def run_attempt(base, dx, dy, ep_dir, render):
         rp.close()
 
 
-def write_meta(ep_dir, episode, dx, dy, result):
+def write_meta(ep_dir, episode, cube_xy, bowl_xy, result):
     meta = {"episode": int(episode),
             "fps": float(CONTROL_HZ),
             "num_frames": int(result["num_frames"]),
             "camera_hw": [int(CAMERA_HW[0]), int(CAMERA_HW[1])],
             "cube_pos": [float(v) for v in result["cube_pos"]],
+            "cube_xy": [float(cube_xy[0]), float(cube_xy[1])],
+            "bowl_xy": [float(bowl_xy[0]), float(bowl_xy[1])],
             "cube_yaw": 0.0,
             "rise_m": float(result["rise_m"]),
             "slip_m": float(result["slip_m"]),
@@ -391,10 +570,12 @@ def write_meta(ep_dir, episode, dx, dy, result):
 
 
 def randomization_note(anchored=False):
-    note = "cube xy in [-%.3f, %.3f] x [-%.3f, %.3f] m, no yaw" % (
-        RANDOM_X_M, RANDOM_X_M, RANDOM_Y_M, RANDOM_Y_M)
+    note = ("cube xy ~ U(%.3f..%.3f) x (%.3f..%.3f), bowl xy ~ U(%.3f..%.3f) x (%.3f..%.3f) m, "
+            "cube-bowl centre distance >= %.3f m, continuous (no grid), cube yaw fixed"
+            % (CUBE_BOX[0], CUBE_BOX[1], CUBE_BOX[2], CUBE_BOX[3],
+               BOWL_BOX[0], BOWL_BOX[1], BOWL_BOX[2], BOWL_BOX[3], MIN_SEP_M))
     if anchored:
-        note += "; waypoints %s anchored at the bowl, everything else shifted with the cube" % (
+        note += "; waypoints %s anchored at the bowl, everything else follows the cube" % (
             "/".join(ANCHORED_LABELS),)
     return note
 
@@ -436,13 +617,13 @@ def main(argv=None):
         if attempts >= args.max_attempts:
             raise SystemExit("gave up after %d attempts with %d episodes accepted"
                              % (attempts, made))
-        dx = float(rng.uniform(-RANDOM_X_M, RANDOM_X_M))
-        dy = float(rng.uniform(-RANDOM_Y_M, RANDOM_Y_M))
+        cube_xy, bowl_xy = sample_layout(rng)
+        dx, dy = layout_offsets(cube_xy)
         attempts += 1
         tmp_dir = os.path.join(out_dir, "_attempt")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         try:
-            result = run_attempt(base, dx, dy, tmp_dir, render=not args.no_render)
+            result = run_attempt(base, cube_xy, bowl_xy, tmp_dir, render=not args.no_render)
         except ReplayError as exc:
             print("[ep%03d] attempt %d dx %+0.4f dy %+0.4f  rejected: %s"
                   % (made, attempts, dx, dy, exc))
@@ -472,9 +653,11 @@ def main(argv=None):
 
         ep_dir = os.path.join(out_dir, "ep%03d" % made)
         shutil.rmtree(ep_dir, ignore_errors=True)
-        write_meta(tmp_dir, made, dx, dy, result)
+        write_meta(tmp_dir, made, cube_xy, bowl_xy, result)
         os.rename(tmp_dir, ep_dir)
         rows.append({"episode": made, "attempt": attempts, "dx": dx, "dy": dy,
+                     "cube_xy": [float(cube_xy[0]), float(cube_xy[1])],
+                     "bowl_xy": [float(bowl_xy[0]), float(bowl_xy[1])],
                      "num_frames": result["num_frames"], "rise_m": result["rise_m"],
                      "slip_m": result["slip_m"], "ik_err_m": result["ik_err_m"],
                      "fk_err_m": result["fk_err_m"],
@@ -504,7 +687,15 @@ def main(argv=None):
              "seed": int(args.seed),
              "mujoco_version": str(mujoco.__version__),
              "randomization": randomization_note(anchored=task == "place"),
-             "generated_by": "experiments/gen_act_dataset.py"}
+             "generated_by": "experiments/gen_act_dataset.py",
+             # The scene's authored centres, i.e. what the XML holds - NOT where a given
+             # episode put them.  The drawn per-episode pair is in each ep%03d/meta.json and
+             # the distribution it was drawn from is cube_box_m/bowl_box_m/min_sep_m below.
+             "cube_xy": [float(CUBE_XY[0]), float(CUBE_XY[1])],
+             "bowl_xy": [float(BOWL_XY[0]), float(BOWL_XY[1])],
+             "cube_box_m": [float(v) for v in CUBE_BOX],
+             "bowl_box_m": [float(v) for v in BOWL_BOX],
+             "min_sep_m": float(MIN_SEP_M)}
     if task == "place":
         index.update(task_kind="place", table=args.table,
                      bowl_xy_m=[float(BOWL_XY[0]), float(BOWL_XY[1])],
@@ -519,10 +710,15 @@ def main(argv=None):
     slips = [r["slip_m"] for r in rows]
     ik_errs = [r["ik_err_m"] for r in rows]
     summary = {"attempts": attempts, "episodes": made, "wall_s": round(wall_s, 2),
-               "control_hz": CONTROL_HZ, "random_x_m": RANDOM_X_M,
-               "random_y_m": RANDOM_Y_M, "seed": args.seed, "rendered": not args.no_render,
+               "control_hz": CONTROL_HZ,
+               "cube_box_m": [float(v) for v in CUBE_BOX],
+               "bowl_box_m": [float(v) for v in BOWL_BOX],
+               "min_sep_m": float(MIN_SEP_M),
+               "seed": args.seed, "rendered": not args.no_render,
                "state_dim": EE_DIM, "action_dim": EE_DIM,
                "ee_site": EE_SITE, "fk_tol_m": FK_TOL,
+               "cube_xy": [float(CUBE_XY[0]), float(CUBE_XY[1])],
+               "bowl_xy": [float(BOWL_XY[0]), float(BOWL_XY[1])],
                "rise_min_m": min(rises), "rise_max_m": max(rises),
                "slip_max_m": max(slips), "ik_err_max_m": max(ik_errs),
                "fk_check_max_err_m": max(r["fk_err_m"] for r in rows),

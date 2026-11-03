@@ -81,6 +81,7 @@ import json
 import os
 import sys
 import time
+import types
 
 import numpy as np
 
@@ -90,11 +91,13 @@ if REPO not in sys.path:
 
 import mujoco  # noqa: E402
 
-from experiments.gen_act_dataset import (ANCHORED_LABELS, BOWL_XY, CAMERAS,  # noqa: E402
-                                         CAMERA_HW, CONTROL_HZ, CUBE_XY, EE_SITE,
-                                         IN_BOWL_RADIUS_M, IN_BOWL_Z, PLACE_TASK,
-                                         RANDOM_X_M, RANDOM_Y_M, TASK, fk_tool, hinge_g,
-                                         place_cube, shifted_table)
+from experiments.gen_act_dataset import (ANCHORED_LABELS, BOWL_BOX, BOWL_XY, CAMERAS,  # noqa: E402
+                                         CAMERA_HW, CONTROL_HZ, CUBE_BOX, CUBE_XY, EE_SITE,
+                                         IN_BOWL_RADIUS_M, IN_BOWL_SEATED_R_M, IN_BOWL_Z,
+                                         MIN_SEP_M, PLACE_TASK,
+                                         TASK, fk_tool, hinge_g, layout_offsets,
+                                         layout_table, place_bowl, place_cube_abs,
+                                         sample_layout)
 from src.pose_cmd.replay import CRITERIA, Replayer, g_to_ctrl, write_png  # noqa: E402
 from src.pose_cmd.waypoints import load_table, plan_trajectory  # noqa: E402
 
@@ -103,7 +106,10 @@ TABLE_PATH = os.path.join(REPO, "configs", "waypoints_cube_lift.json")
 PLACE_TABLE_PATH = os.path.join(REPO, "configs", "waypoints_cube_place.json")
 DEFAULT_CKPT = os.path.join(REPO, "out", "act_train_ee", "checkpoints", "last",
                             "pretrained_model")
-PLACE_CKPT = os.path.join(REPO, "out", "act_train_place", "checkpoints", "last",
+# step 6000 of out/act_train_place_rand, not "last": over 4 seeds x 20 random layouts the
+# 20000-step checkpoint is among the worst (5/20 judged on seed 0) while the training loss is
+# still falling - closed-loop success stops tracking loss after ~6k-14k (docs §12.7).
+PLACE_CKPT = os.path.join(REPO, "out", "act_train_place_rand", "checkpoints", "006000",
                           "pretrained_model")
 DEFAULT_OUT = os.path.join(REPO, "out", "act_rollout")
 PLACE_OUT = os.path.join(REPO, "out", "act_rollout_place")
@@ -139,9 +145,14 @@ def _torch():
 
 
 def sample_offsets(rng):
-    """One trial's cube offset, drawn in the order the demos were drawn (dx then dy)."""
-    return (float(rng.uniform(-RANDOM_X_M, RANDOM_X_M)),
-            float(rng.uniform(-RANDOM_Y_M, RANDOM_Y_M)))
+    """One trial's cube offset, in the order the demos were drawn (dx then dy).
+
+    A thin adapter over gen_act_dataset.sample_layout(): that function is the only place the
+    layout distribution lives, so a rollout cannot sample a box the demos were not drawn
+    from. The offsets are derived from the returned centre exactly the way the generator
+    derives them for its summary rows."""
+    cube_xy, _bowl_xy = sample_layout(rng)
+    return layout_offsets(cube_xy)
 
 
 def runaway(model, qpos, act):
@@ -159,15 +170,42 @@ def runaway(model, qpos, act):
     return bool(np.any(lim & ((q < lo - JNT_TOL_RAD) | (q > hi + JNT_TOL_RAD))))
 
 
-def bowl_metrics(cube_end):
+def bowl_metrics(cube_end, bowl_xy=None):
     """(bowl_dxy_m, in_bowl) for a cube centre - the place task's own measurement.
 
     in_bowl needs both terms: horizontal distance rules out the table beside the bowl, and the
-    height window rules out a cube perched on the rim (wall top z = 0.840) or below the floor."""
+    height window rules out a cube perched on the rim (wall top z = 0.840) or below the floor.
+    bowl_xy defaults to the scene's BOWL_XY; pass the trial's layout when the bowl moved."""
+    bowl_xy = BOWL_XY if bowl_xy is None else bowl_xy
     cube_end = np.asarray(cube_end, dtype=float)
-    dxy = float(np.hypot(cube_end[0] - BOWL_XY[0], cube_end[1] - BOWL_XY[1]))
+    dxy = float(np.hypot(cube_end[0] - bowl_xy[0], cube_end[1] - bowl_xy[1]))
     inside_z = IN_BOWL_Z[0] < float(cube_end[2]) < IN_BOWL_Z[1]
     return dxy, bool(dxy < IN_BOWL_RADIUS_M and inside_z)
+
+
+def trial_layout(rows):
+    """The layout the trials actually ran, for the summary's top-level fields.
+
+    Returns (cube_xy, bowl_xy, spread). cube_xy/bowl_xy are the single (x, y) pair every
+    trial used, or None when the trials disagreed - the truth is then per_trial[i].cube_xy /
+    .bowl_xy, which every row carries. spread is None when the bowls agree, else
+    {"min", "max", "distinct"} over them: a moved bowl must never be reported as the scene's
+    BOWL_XY just because that is where the sampler is anchored."""
+    def same(field):
+        seen = {(float(r[field][0]), float(r[field][1])) for r in rows}
+        if len(seen) != 1:
+            return None
+        x, y = seen.pop()
+        return [x, y]
+
+    cube_xy, bowl_xy = same("cube_xy"), same("bowl_xy")
+    spread = None
+    if rows and bowl_xy is None:
+        xs = [float(r["bowl_xy"][0]) for r in rows]
+        ys = [float(r["bowl_xy"][1]) for r in rows]
+        spread = {"min": [min(xs), min(ys)], "max": [max(xs), max(ys)],
+                  "distinct": len(set(zip(xs, ys)))}
+    return cube_xy, bowl_xy, spread
 
 
 def classify_place(rec):
@@ -318,14 +356,15 @@ def load_policy(ckpt, device, seed=0):
     return policy, pre, post
 
 
-def reset_arm(rp, start, base_table, dx, dy):
-    """Put the arm where --start says, cube not yet placed (place_cube runs afterwards)."""
+def reset_arm(rp, start, base_table, cube_xy, bowl_xy):
+    """Put the arm where --start says, cube not yet placed (place_cube_abs runs afterwards)."""
     if start == "keyframe":
         mujoco.mj_resetDataKeyframe(rp.model, rp.data, rp.key_id)
         rp.data.qvel[:] = 0.0
         mujoco.mj_forward(rp.model, rp.data)
         return
-    table = shifted_table(base_table, dx, dy) if start == "approach" else base_table
+    table = (layout_table(base_table, cube_xy, bowl_xy) if start == "approach"
+             else base_table)
     first = np.asarray(plan_trajectory(table).ee8[0], dtype=float)
     res = rp.solve_frame("approach", first[0:3], first[3:6], rp.home_qpos())
     rp.teleport(np.array(res.qpos, dtype=float), float(first[6]))
@@ -343,19 +382,23 @@ def load_episodes(root):
 
 
 def load_demo(ep_dir):
-    """pose8_action/pose8_state plus the cube offset the episode was recorded with.
+    """pose8_action/pose8_state plus the cube and bowl layout the episode was recorded with.
 
-    The offset is read back from meta.json's cube_pos instead of being resampled: a replay
-    that started at a different cube would be validating something else. It is the same
-    offset gen_act_dataset matched the shifted table with, so --start approach lands on the
-    recording's own first frame."""
+    The layout is read back from meta.json instead of being resampled: a replay that started
+    at a different cube or bowl would be validating something else. It is the same layout
+    gen_act_dataset laid the table out with, so --start approach lands on the recording's own
+    first frame. meta.json written before the layout pair existed has no cube_xy/bowl_xy, so
+    it falls back to cube_pos (the cube centre) and the scene's BOWL_XY."""
     with np.load(os.path.join(ep_dir, "data.npz")) as npz:
         action = np.array(npz["pose8_action"], dtype=np.float64)
         state = np.array(npz["pose8_state"], dtype=np.float64)
     with open(os.path.join(ep_dir, "meta.json")) as fh:
         meta = json.load(fh)
-    cube = np.asarray(meta["cube_pos"], dtype=np.float64)
+    cube = np.asarray(meta.get("cube_xy") or meta["cube_pos"], dtype=np.float64)
+    bowl = np.asarray(meta.get("bowl_xy") or BOWL_XY, dtype=np.float64)
     return {"pose8_action": action, "pose8_state": state,
+            "cube_xy": (float(cube[0]), float(cube[1])),
+            "bowl_xy": (float(bowl[0]), float(bowl[1])),
             "dx": float(cube[0] - CUBE_XY[0]), "dy": float(cube[1] - CUBE_XY[1]),
             "dir": ep_dir}
 
@@ -403,16 +446,18 @@ def open_video(path, fps, width, height):
         return None
 
 
-def rollout(rp, renderer, cam_ids, args, trial_dir, trial, dx, dy,
+def rollout(rp, renderer, cam_ids, args, trial_dir, trial, cube_xy, bowl_xy,
             policy=None, pre=None, post=None, demo=None):
-    """One trial. Returns the record; writes trial_XX.mp4 and PNG keyframes if asked.
+    """One trial at the layout (cube_xy, bowl_xy). Returns the record; writes trial_XX.mp4
+    and PNG keyframes if asked.
 
     With demo=None the actions come from the policy (renderer must be live, since the images
     are half the observation); with demo=<load_demo()> they come from the episode's own
     pose8_action rows and no camera, no policy and no checkpoint is touched."""
     model = rp.model
-    reset_arm(rp, args.start, args.base_table, dx, dy)
-    place_cube(rp, dx, dy)
+    reset_arm(rp, args.start, args.base_table, cube_xy, bowl_xy)
+    place_bowl(rp, bowl_xy)
+    place_cube_abs(rp, cube_xy)
     cube0 = rp.cube_pos()
     q0 = np.array(rp.data.qpos[:7], dtype=float)
     torch = _torch() if policy is not None else None
@@ -434,7 +479,11 @@ def rollout(rp, renderer, cam_ids, args, trial_dir, trial, dx, dy,
     # Held when a tick cannot be decoded, so even the very first tick has something to fall
     # back on: the reset pose itself, i.e. the arm keeps its feet under it.
     prev_ctrl = ctrl_row(rp, q0[:6], hinge_g(q0[6]))
-    rec = {"trial": int(trial), "dx": dx, "dy": dy, "steps": 0, "diverged": False,
+    rec = {"trial": int(trial), "dx": float(cube_xy[0] - CUBE_XY[0]),
+           "dy": float(cube_xy[1] - CUBE_XY[1]),
+           "cube_xy": [float(cube_xy[0]), float(cube_xy[1])],
+           "bowl_xy": [float(bowl_xy[0]), float(bowl_xy[1])],
+           "steps": 0, "diverged": False,
            "diverged_tick": None, "grasp_tick": None, "grasp_g": None,
            "cmd_g_min": None, "arm_travel_rad": 0.0, "rise_curve": [], "infer_s": 0.0,
            "mode": "replay" if demo is not None else "policy",
@@ -559,10 +608,13 @@ def rollout(rp, renderer, cam_ids, args, trial_dir, trial, dx, dy,
     rec["infer_ms"] = 1000.0 * rec["infer_s"] / max(1, rec["steps"])
     rec["ik_ms"] = 1000.0 * rec["ik_s"] / max(1, rec["steps"])
     if getattr(args, "task", "lift") == "place":
-        rec["bowl_dxy_m"], rec["in_bowl"] = bowl_metrics(cube_end)
+        rec["bowl_dxy_m"], rec["in_bowl"] = bowl_metrics(cube_end, bowl_xy)
         rec["hold_err_m"] = None if not np.isfinite(hold_err) else float(hold_err)
         rec["cmd_g_last"] = cmd_g_last
         rec["released"] = bool(float(rec["tool_offset_m"]) >= RELEASE_SEP_M)
+        # second, stricter reading of the same trial: inside the bowl AND close enough that the
+        # cube is sitting on the floor instead of propped against the curved wall
+        rec["seated"] = bool(rec["in_bowl"] and rec["bowl_dxy_m"] < IN_BOWL_SEATED_R_M)
         rec["outcome"] = classify_place(rec)
     else:
         rec["outcome"] = classify(rec)
@@ -574,19 +626,27 @@ def rollout(rp, renderer, cam_ids, args, trial_dir, trial, dx, dy,
 def play_in_viewer(scene, traces, control_hz, passes=0):
     """Replay recorded rollouts in an interactive MuJoCo window, one after another.
 
-    passes=0 keeps looping until the window is closed. Each frame writes the whole qpos (arm
-    and cube), so this is playback, not a second simulation: nothing here can diverge."""
+    Each trace is (bowl_xy, frames). The window rebuilds the model from the scene XML, so the
+    bowl has to be moved to that trial's layout *before* its frames play - otherwise every
+    random-layout trial replays with the bowl still at the scene default and the cube visibly
+    lands where the bowl is not, while the recorded metrics say in_bowl. The frames carry the
+    whole qpos (arm, gripper, cube), so playback itself cannot diverge.
+
+    passes=0 keeps looping until the window is closed."""
     import mujoco.viewer
 
     model = mujoco.MjModel.from_xml_path(os.path.abspath(scene))
     data = mujoco.MjData(model)
+    # place_bowl only needs .model and .data; the viewer owns both, not a Replayer
+    scene_state = types.SimpleNamespace(model=model, data=data)
     period = 1.0 / control_hz
     loop = 0
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
-            for i, trace in enumerate(traces):
+            for i, (bowl_xy, frames) in enumerate(traces):
+                place_bowl(scene_state, bowl_xy)
                 next_tick = time.monotonic()
-                for q in trace:
+                for q in frames:
                     if not viewer.is_running():
                         break
                     data.qpos[:] = q
@@ -596,8 +656,8 @@ def play_in_viewer(scene, traces, control_hz, passes=0):
                     slack = next_tick - time.monotonic()
                     if slack > 0:
                         time.sleep(slack)
-                print("[viewer] loop %d trial %02d: %d frames (%d Hz)"
-                      % (loop, i, len(trace), control_hz), flush=True)
+                print("[viewer] loop %d trial %02d: %d frames (%d Hz) bowl %.3f %+.3f"
+                      % (loop, i, len(frames), control_hz, bowl_xy[0], bowl_xy[1]), flush=True)
                 if not viewer.is_running():
                     break
             loop += 1
@@ -705,15 +765,19 @@ def main(argv=None):
     try:
         for i in range(trials):
             demo = replay[i] if replay is not None else None
-            dx, dy = (demo["dx"], demo["dy"]) if demo is not None else sample_offsets(rng)
+            if demo is not None:
+                cube_xy, bowl_xy = demo["cube_xy"], demo["bowl_xy"]
+            else:
+                cube_xy, bowl_xy = sample_layout(rng)
+            dx, dy = layout_offsets(cube_xy)
             if policy is not None:
                 policy.reset()
             t0 = time.perf_counter()
-            rec = rollout(rp, renderer, cam_ids, args, out_dir, i, dx, dy,
+            rec = rollout(rp, renderer, cam_ids, args, out_dir, i, cube_xy, bowl_xy,
                           policy=policy, pre=pre, post=post, demo=demo)
             rec["wall_s"] = round(time.perf_counter() - t0, 3)
             if args.viewer and rec["trace"]:
-                traces.append(rec.pop("trace"))
+                traces.append((bowl_xy, rec.pop("trace")))
             else:
                 rec.pop("trace", None)
             rows.append(rec)
@@ -737,6 +801,7 @@ def main(argv=None):
 
     ok = sum(1 for r in rows if r["success"])
     total = time.perf_counter() - t_all
+    cube_xy0, bowl_xy0, bowl_spread = trial_layout(rows)
     summary = {
         "ckpt": ckpt if replay is None else None, "device": args.device, "start": args.start,
         "seed": args.seed,
@@ -752,7 +817,14 @@ def main(argv=None):
                      "max_slip_m": CRITERIA["max_slip_m"],
                      "max_ik_err_m": 2.0e-3,
                      "grasp_g_below": GRASP_G, "ctrl_limit": CTRL_LIMIT},
-        "randomization_m": {"x": RANDOM_X_M, "y": RANDOM_Y_M, "cube_xy0": list(CUBE_XY)},
+        # cube_xy0/bowl_xy0: the one layout the trials ran. None when they differed - the
+        # sampler may be anchored anywhere, so CUBE_XY/BOWL_XY are never claimed here unless
+        # the trials really used them; per_trial[i].cube_xy/.bowl_xy is the truth either way
+        # the boxes the sampler actually draws in (gen_act_dataset.CUBE_BOX/BOWL_BOX), not
+        # the historical +-0.020/+-0.005 offset box
+        "layout_m": {"cube_box_m": list(CUBE_BOX), "bowl_box_m": list(BOWL_BOX),
+                     "min_sep_m": MIN_SEP_M,
+                     "cube_xy0": cube_xy0, "bowl_xy0": bowl_xy0},
         "trials": len(rows), "successes": int(ok),
         "success_rate": round(ok / len(rows), 4) if rows else 0.0,
         "outcomes": {k: sum(1 for r in rows if r["outcome"] == k)
@@ -783,7 +855,9 @@ def main(argv=None):
         summary["task_kind"] = "place"
         summary["table"] = os.path.relpath(PLACE_TABLE_PATH, REPO)
         summary["anchored_labels"] = list(ANCHORED_LABELS)
-        summary["bowl_xy_m"] = [float(BOWL_XY[0]), float(BOWL_XY[1])]
+        # the bowl that was actually used: the same [x, y] for every trial, or the spread
+        # {"min", "max", "distinct"} when the trials sat at different bowls
+        summary["bowl_xy_m"] = bowl_xy0 if bowl_spread is None else bowl_spread
         summary["criteria"] = {"release_sep_m": RELEASE_SEP_M,
                                "in_bowl_radius_m": IN_BOWL_RADIUS_M,
                                "in_bowl_z": [float(IN_BOWL_Z[0]), float(IN_BOWL_Z[1])],
@@ -795,6 +869,7 @@ def main(argv=None):
                                               default=0.0), 6)
         summary["in_bowl_count"] = sum(1 for r in rows if r["in_bowl"])
         summary["in_bowl_all"] = bool(rows) and summary["in_bowl_count"] == len(rows)
+        summary["seated_count"] = sum(1 for r in rows if r.get("seated"))
         summary["hold_err_max_m"] = max((r["hold_err_m"] for r in rows
                                          if r["hold_err_m"] is not None), default=None)
     with open(os.path.join(out_dir, "summary.json"), "w") as fh:
@@ -819,7 +894,8 @@ def main(argv=None):
             print("[viewer] nothing to replay: no trial produced frames", flush=True)
         else:
             print("[viewer] opening the MuJoCo window: %d trial(s), %d frames total; "
-                  "close the window to stop" % (len(traces), sum(len(t) for t in traces)),
+                  "close the window to stop"
+                  % (len(traces), sum(len(frames) for _, frames in traces)),
                   flush=True)
             sys.stdout.flush()
             loops = play_in_viewer(SCENE, traces, CONTROL_HZ, args.viewer_passes)

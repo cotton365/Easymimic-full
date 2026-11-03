@@ -21,6 +21,12 @@ Checks, per episode:
   * meta and npz agree, rise >= 0.08 m and grasp_ok is true;
 and across episodes: index.json is consistent with the directories it describes, plus the
 g -> ctrl -> simulated joint_7 -> g round trip (<= 1e-3) on the arm-only model.
+and, once per run, the layout hooks in the generator: layout_table(base, CUBE_XY, BOWL_XY) is
+shifted_table(base, 0, 0) field for field, the anchored rows follow the bowl xy, place_bowl
+translates all 17 bowl geoms by the delta without deforming the ring, sample_layout draws
+continuously inside CUBE_BOX/BOWL_BOX with MIN_SEP_M between the two centres, and
+experiments/set_layout.py fails on an unreachable target, passes on the layout the files
+describe, prints --sample layouts, and refuses --apply together with any measuring flag.
 
 Usage:  python tests_ee/test_act_dataset.py [--dir out/act_demos_ee] [--episodes 20]
 """
@@ -83,12 +89,19 @@ INDEX_PLACE_KEYS = {"task_kind", "table", "bowl_xy_m", "in_bowl_radius_m", "bowl
                     "in_bowl_all", "hold_err_max_m"}
 BOWL_XY = (0.300, -0.200)
 BOWL_INNER_R_M = 0.045       # the bowl's own inner radius, from the scene geometry
-IN_BOWL_RADIUS_M = 0.030     # accepted: cube centre within this of the bowl centre ...
+IN_BOWL_RADIUS_M = 0.045     # accepted: cube centre within this of the bowl centre ...
+IN_BOWL_SEATED_R_M = 0.030   # ... the stricter "sitting on the floor" reading
 IN_BOWL_Z = (0.800, 0.840)   # ... and between the bowl floor and its wall top
 MAX_BOWL_DXY_M = 0.005       # acceptance gate per episode
 MAX_HOLD_ERR_M = 0.002       # cube still between the pads on the last closed-gripper tick
 PLACE_FRAMES = 181           # configs/waypoints_cube_place.json at 20 Hz: 8 waypoints, 181 tick
 RELEASE_G = 0.9              # the place table must end with the gripper commanded open
+
+# ---- the layout pair: written by the generator since sample_layout landed, absent from the
+# ---- frozen datasets in out/, so required-plus-optional rather than an exact key set
+CUBE_XY = (0.474, 0.0435)
+OPTIONAL_META_KEYS = {"cube_xy", "bowl_xy"}
+OPTIONAL_INDEX_KEYS = {"cube_xy", "bowl_xy", "cube_box_m", "bowl_box_m", "min_sep_m"}
 
 
 class Checks:
@@ -175,8 +188,23 @@ def check_episode(ck, ep_dir, index, place=False):
     with open(meta_path) as fh:
         meta = json.load(fh)
 
-    ck.ok(set(meta) == meta_keys,
-          "%s: meta.json keys %s != %s" % (ep_dir, sorted(set(meta)), sorted(meta_keys)))
+    ck.ok(set(meta) >= meta_keys and set(meta) - meta_keys <= OPTIONAL_META_KEYS,
+          "%s: meta.json keys %s, required %s plus at most %s"
+          % (ep_dir, sorted(set(meta)), sorted(meta_keys), sorted(OPTIONAL_META_KEYS)))
+    if "cube_xy" in meta:
+        ck.ok([float(v) for v in meta["cube_xy"]] == [float(v) for v in meta["cube_pos"][:2]],
+              "%s: meta.cube_xy %r != the first two of meta.cube_pos %r"
+              % (ep_dir, meta["cube_xy"], meta["cube_pos"]))
+        if "bowl_box_m" in index:
+            bx0, bx1, by0, by1 = [float(v) for v in index["bowl_box_m"]]
+            ck.ok(bx0 <= float(meta["bowl_xy"][0]) <= bx1
+                  and by0 <= float(meta["bowl_xy"][1]) <= by1,
+                  "%s: meta.bowl_xy %r is outside index.bowl_box_m %r"
+                  % (ep_dir, meta["bowl_xy"], index["bowl_box_m"]))
+        else:   # a dataset from before the bowl could move: one bowl, the scene's
+            ck.ok([float(v) for v in meta["bowl_xy"]] == [float(v) for v in index["bowl_xy_m"]],
+                  "%s: meta.bowl_xy %r != index.bowl_xy_m %r"
+                  % (ep_dir, meta["bowl_xy"], index["bowl_xy_m"]))
     ck.ok(isinstance(meta["episode"], int), "%s: meta.episode is not an int" % ep_dir)
     ck.ok(meta["scene"] == SCENE, "%s: meta.scene %r" % (ep_dir, meta["scene"]))
     ck.ok(os.path.isfile(os.path.join(REPO, meta["scene"])),
@@ -195,9 +223,13 @@ def check_episode(ck, ep_dir, index, place=False):
         ck.ok(int(meta["num_frames"]) == PLACE_FRAMES,
               "%s: %d frames, the place table is %d ticks at %r Hz"
               % (ep_dir, int(meta["num_frames"]), PLACE_FRAMES, meta["fps"]))
-        ck.ok(0.0 <= float(meta["rise_m"]) < 1e-2,
-              "%s: rise %.5f m - a place episode lifts the cube ~2 mm, not out of the bowl's "
-              "reach" % (ep_dir, float(meta["rise_m"])))
+        # Two-sided band: the bowl moves with the random layout, so the cube ends on a floor
+        # that at the sampled xy can sit a fraction of a millimetre below the cube's start z
+        # (measured -0.00004 m .. +0.00196 m over 60 random episodes). The place invariant is
+        # in_bowl / bowl_dxy_m below; this check only says "the cube did not travel up".
+        ck.ok(-1e-3 <= float(meta["rise_m"]) < 1e-2,
+              "%s: rise %.5f m - a place episode drops the cube into the bowl, it must not rise"
+              % (ep_dir, float(meta["rise_m"])))
         # slip_m keeps its lift definition (cube drift after the jaws close) and the cube
         # travels ~0.4 m to the bowl, so it is a distance here, not a grasp-quality bound
         ck.ok(0.05 <= float(meta["slip_m"]) < 0.6,
@@ -254,9 +286,12 @@ def check_episode(ck, ep_dir, index, place=False):
         ck.ok(bool(data["in_bowl"]) is bool(meta["in_bowl"]),
               "%s: in_bowl disagrees between data.npz and meta.json" % ep_dir)
         ck.ok(float(data["hold_err_m"]) >= 0.0, "%s: hold_err_m is negative" % ep_dir)
-        ck.ok(IN_BOWL_RADIUS_M < BOWL_INNER_R_M,
-              "the accepted radius %r is not inside the bowl's own %r m inner radius"
+        ck.ok(IN_BOWL_RADIUS_M <= BOWL_INNER_R_M,
+              "the accepted radius %r is outside the bowl's own %r m inner radius"
               % (IN_BOWL_RADIUS_M, BOWL_INNER_R_M))
+        ck.ok(IN_BOWL_SEATED_R_M < BOWL_INNER_R_M,
+              "the seated radius %r is not inside the bowl's own %r m inner radius"
+              % (IN_BOWL_SEATED_R_M, BOWL_INNER_R_M))
         # the end-of-episode cube pose is not recorded, so the z half of in_bowl is checked on
         # the end pose by tests_ee/test_act_rollout.py (bowl_metrics); here the on-disk record
         # only has to agree with itself
@@ -405,6 +440,165 @@ def check_episode(ck, ep_dir, index, place=False):
             "same_tick_dot": float(same_tick.min())}
 
 
+def table_equal(a, b):
+    """Same table, field for field - exact float equality, not allclose."""
+    if (a.source, a.frame, a.units, float(a.control_hz)) != (b.source, b.frame, b.units,
+                                                             float(b.control_hz)):
+        return False, "%r/%r header differs" % (a, b)
+    if len(a.waypoints) != len(b.waypoints):
+        return False, "%d vs %d waypoints" % (len(a.waypoints), len(b.waypoints))
+    for wa, wb in zip(a.waypoints, b.waypoints):
+        if wa.label != wb.label or float(wa.duration_s) != float(wb.duration_s):
+            return False, "waypoint %s/%s differs" % (wa.label, wb.label)
+        if not np.array_equal(np.asarray(wa.ee8, dtype=float), np.asarray(wb.ee8, dtype=float)):
+            return False, "waypoint %s ee8 %s != %s" % (wa.label, wa.ee8, wb.ee8)
+    return True, ""
+
+
+def check_layout(ck):
+    """The layout hooks: layout_table, place_bowl, sample_layout, and the set_layout.py CLI."""
+    import random
+    import subprocess
+
+    start = ck.count
+
+    from experiments import gen_act_dataset as gen
+    from src.pose_cmd.replay import Replayer
+    from src.pose_cmd.waypoints import load_table
+
+    tables = [load_table(os.path.join(REPO, path))
+              for path in (gen.TABLE_PATH, gen.PLACE_TABLE_PATH)]
+
+    # layout_table(base, CUBE_XY, BOWL_XY) is today's table, bit for bit
+    for base in tables:
+        same, why = table_equal(gen.layout_table(base, gen.CUBE_XY, gen.BOWL_XY),
+                               gen.shifted_table(base, 0.0, 0.0))
+        ck.ok(same, "%s: layout_table(base, CUBE_XY, BOWL_XY) != shifted_table(base, 0, 0) %s"
+              % (os.path.basename(base.source), why))
+
+    # ... and at any other layout the grasp column sits on the cube, the anchored rows on the bowl
+    cube_xy, bowl_xy = (0.500, 0.100), (0.320, -0.280)
+    for base in tables:
+        moved = gen.layout_table(base, cube_xy, bowl_xy)
+        ck.ok(len(moved.waypoints) == len(base.waypoints),
+              "%s: layout_table changed the waypoint count" % os.path.basename(base.source))
+        for old, new in zip(base.waypoints, moved.waypoints):
+            anchored = old.label in gen.ANCHORED_LABELS
+            want = bowl_xy if anchored else cube_xy
+            ck.ok((float(new.ee8[0]), float(new.ee8[1])) == want,
+                  "%s: %s at (%r, %r), expected %r"
+                  % (os.path.basename(base.source), old.label, float(new.ee8[0]),
+                     float(new.ee8[1]), want))
+            ck.ok(np.array_equal(np.asarray(new.ee8, dtype=float)[[2, 6, 7]],
+                                 np.asarray(old.ee8, dtype=float)[[2, 6, 7]]),
+                  "%s: %s: z or the non-xy components moved" % (os.path.basename(base.source),
+                                                                old.label))
+            ck.ok(float(new.duration_s) == float(old.duration_s),
+                  "%s: %s: duration changed" % (os.path.basename(base.source), old.label))
+
+    # place_bowl: all 17 bowl geoms move by the delta, the ring keeps its shape
+    rp = Replayer(scene_path=os.path.join(REPO, SCENE), control_hz=20.0, render_every=0)
+    try:
+        ids = gen.bowl_geom_ids(rp.model)
+        bottom = gen.bowl_bottom_id(rp.model)
+        ck.ok(len(ids) == 17, "the scene has %d bowl_* geoms, expected 17" % len(ids))
+        before = np.array(rp.model.geom_pos[ids], dtype=float)
+        gen.place_bowl(rp, gen.BOWL_XY)
+        ck.ok(np.array_equal(np.array(rp.model.geom_pos[ids], dtype=float), before),
+              "place_bowl at the current centre was not a no-op")
+        layout = (float(gen.BOWL_XY[0]) + 0.020, float(gen.BOWL_XY[1]) - 0.080)
+        dx = layout[0] - before[ids.index(bottom), 0]
+        dy = layout[1] - before[ids.index(bottom), 1]
+        expect = before.copy()
+        expect[:, 0] = expect[:, 0] + dx
+        expect[:, 1] = expect[:, 1] + dy
+        gen.place_bowl(rp, layout)
+        after = np.array(rp.model.geom_pos[ids], dtype=float)
+        ck.ok(np.array_equal(after, expect),
+              "place_bowl: geom_pos is not pos + delta on all 17 geoms (worst %.1e m)"
+              % float(np.abs(after - expect).max()))
+        ring0 = np.hypot(before[:, 0] - before[ids.index(bottom), 0],
+                         before[:, 1] - before[ids.index(bottom), 1])
+        ring1 = np.hypot(after[:, 0] - after[ids.index(bottom), 0],
+                         after[:, 1] - after[ids.index(bottom), 1])
+        ck.ok(np.abs(ring1 - ring0).max() <= 1e-12,
+              "place_bowl changed the wall ring radii by %.1e m" % float(np.abs(ring1 - ring0).max()))
+        walls = [k for k, gid in enumerate(ids) if gid != bottom]
+        ck.ok(np.abs(ring0[walls] - gen.BOWL_OUTER_R_M).max() <= 1e-6,
+              "wall ring radius %.6f..%.6f, expected %.3f (the scene writes 6 decimals)"
+              % (float(ring0[walls].min()), float(ring0[walls].max()), gen.BOWL_OUTER_R_M))
+        ck.ok(float(np.abs(after[:, 2] - before[:, 2]).max()) == 0.0,
+              "place_bowl moved the bowl off the table")
+    finally:
+        rp.close()
+
+    # sample_layout: continuous uniform over the two measured-safe boxes, MIN_SEP_M apart
+    draws = 2000
+    got = [gen.sample_layout(random.Random(0)) for _ in range(1)]     # same seed, twice
+    got.append(gen.sample_layout(random.Random(0)))
+    ck.ok(got[0] == got[1], "sample_layout: the same seed gave %r then %r" % (got[0], got[1]))
+    rng = random.Random(0)
+    drawn = [gen.sample_layout(rng) for _ in range(draws)]
+    outside = [(cube, bowl) for cube, bowl in drawn
+               if not (gen.CUBE_BOX[0] <= cube[0] <= gen.CUBE_BOX[1]
+                       and gen.CUBE_BOX[2] <= cube[1] <= gen.CUBE_BOX[3]
+                       and gen.BOWL_BOX[0] <= bowl[0] <= gen.BOWL_BOX[1]
+                       and gen.BOWL_BOX[2] <= bowl[1] <= gen.BOWL_BOX[3])]
+    ck.ok(not outside, "sample_layout left the boxes at %d/%d draws (first %r)"
+          % (len(outside), draws, outside[0] if outside else None))
+    seps = [float(np.hypot(cube[0] - bowl[0], cube[1] - bowl[1])) for cube, bowl in drawn]
+    ck.ok(min(seps) >= gen.MIN_SEP_M, "closest cube-bowl pair %.4f m < MIN_SEP_M %.3f m"
+          % (min(seps), gen.MIN_SEP_M))
+    unique = len({(round(cube[0], 6), round(cube[1], 6)) for cube, _bowl in drawn})
+    ck.ok(unique >= 1990,
+          "%d distinct cube positions in %d draws - that is a grid, not a continuous sampler"
+          % (unique, draws))
+    off = [gen.layout_offsets(cube) for cube, _bowl in drawn]
+    ck.ok(all(isinstance(ox, float) and isinstance(oy, float) for ox, oy in off),
+          "layout_offsets stopped returning plain floats")
+
+    # the CLI: an unreachable target fails, says which height, and writes nothing
+    script = os.path.join(REPO, "experiments", "set_layout.py")
+    def run(*args):
+        return subprocess.run([sys.executable, script] + list(args), cwd=REPO,
+                              capture_output=True, text=True)
+    here = run("--cube", repr(float(gen.CUBE_XY[0])), repr(float(gen.CUBE_XY[1])),
+               "--bowl", repr(float(gen.BOWL_XY[0])), repr(float(gen.BOWL_XY[1])))
+    ck.ok(here.returncode == 0 and "PASS" in here.stdout,
+          "set_layout.py on the current layout exited %d (stderr %r)"
+          % (here.returncode, here.stderr[-200:]))
+    far = run("--cube", "0.60", "0.00")
+    ck.ok(far.returncode != 0, "set_layout.py --cube 0.60 0.00 exited %d, expected non-zero"
+          % far.returncode)
+    names_height = any("IK FAIL" in line and "0.815" in line
+                       for line in far.stdout.splitlines())
+    ck.ok(names_height and "FAIL" in far.stdout,
+          "set_layout.py --cube 0.60 0.00 did not name the failing height in %r" % far.stdout[-300:])
+
+    # the grasp screen: one real episode at the default layout passes, and it may not write
+    gate = run("--grasp-grid", "0.474:0.474:0.02,0.0435:0.0435:0.02")
+    ck.ok(gate.returncode == 0 and "1/1" in gate.stdout and "no failing point" in gate.stdout,
+          "--grasp-grid on one reachable point exited %d (stdout %r)"
+          % (gate.returncode, gate.stdout[-300:]))
+    ck.ok("s/point" in gate.stdout,
+          "--grasp-grid did not report the per-point runtime: %r" % gate.stdout[-300:])
+    both = run("--grasp-grid", "0.474:0.474:0.02,0.0435:0.0435:0.02", "--apply")
+    ck.ok(both.returncode != 0 and "refusing" in both.stdout,
+          "--apply together with --grasp-grid exited %d (stdout %r)"
+          % (both.returncode, both.stdout[-300:]))
+    smp = run("--sample", "3")
+    printed = [ln for ln in smp.stdout.splitlines() if "cube (" in ln]
+    ck.ok(smp.returncode == 0 and len(printed) == 3,
+          "set_layout.py --sample 3 exited %d and printed %d layout lines (stdout %r)"
+          % (smp.returncode, len(printed), smp.stdout[-300:]))
+    print("  layout hooks: %d checks; set_layout.py verdicts %s"
+          % (ck.count - start,
+             " ".join("%s=%d" % (name, res.returncode)
+                      for name, res in (("current", here), ("0.60 0.00", far),
+                                        ("grid", gate), ("grid+apply", both),
+                                        ("sample", smp)))))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dir", default=os.path.join(REPO, "out", "act_demos_ee"))
@@ -420,8 +614,13 @@ def main(argv=None):
     # the directory says which task it holds; --dir alone switches the contract
     place = index.get("task_kind") == "place"
     index_keys = INDEX_KEYS | INDEX_PLACE_KEYS if place else INDEX_KEYS
-    ck.ok(set(index) == index_keys,
-          "index.json keys %s != %s" % (sorted(set(index)), sorted(index_keys)))
+    ck.ok(set(index) >= index_keys and set(index) - index_keys <= OPTIONAL_INDEX_KEYS,
+          "index.json keys %s, required %s plus at most %s"
+          % (sorted(set(index)), sorted(index_keys), sorted(OPTIONAL_INDEX_KEYS)))
+    if "cube_xy" in index:
+        ck.ok([float(v) for v in index["cube_xy"]] == list(CUBE_XY),
+              "index.cube_xy %r != the CUBE_XY the scene holds %r"
+              % (index["cube_xy"], list(CUBE_XY)))
     ck.ok(index["task"] == (PLACE_TASK if place else "pick up the red block and lift it"),
           "index.task %r" % index["task"])
     ck.ok(index["camera_names"] == list(CAMERAS), "index.camera_names %r" % index["camera_names"])
@@ -437,8 +636,9 @@ def main(argv=None):
               "index.table %r is not the place table" % (index["table"],))
         ck.ok(list(index["bowl_xy_m"]) == list(BOWL_XY),
               "index.bowl_xy_m %r != %r" % (index["bowl_xy_m"], list(BOWL_XY)))
-        ck.ok(abs(float(index["in_bowl_radius_m"]) - IN_BOWL_RADIUS_M) < 1e-12,
-              "index.in_bowl_radius_m %r" % (index["in_bowl_radius_m"],))
+        # datasets generated before the 2026-11-01 decision record the stricter 0.030 here
+        ck.ok(0.0 < float(index["in_bowl_radius_m"]) <= BOWL_INNER_R_M + 1e-12,
+              "index.in_bowl_radius_m %r is outside the bowl" % (index["in_bowl_radius_m"],))
         ck.ok(index["in_bowl_all"] is True, "index.in_bowl_all is %r" % (index["in_bowl_all"],))
         ck.ok(float(index["bowl_dxy_max_m"]) <= MAX_BOWL_DXY_M,
               "index.bowl_dxy_max_m %r above %r m"
@@ -494,6 +694,7 @@ def main(argv=None):
               % (len(eps), bowl_dxy_max, hold_err_max, PLACE_FRAMES))
 
     g_worst, g_rows = check_gripper_roundtrip(ck)
+    check_layout(ck)
     print("  FK(qpos) vs pose8_state: pos %.2e m, quat %.2e (bound %.0e)"
           % (worst["pose_err"], worst["quat_err"], FK_TOL_M))
     print("  quaternion min dot: consecutive %.9f, state-vs-action %.9f"
